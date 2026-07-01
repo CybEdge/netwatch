@@ -1,0 +1,11 @@
+# Router DHCP / manual client name (from router-clients.sh)
+id: router-dhcp
+name: Router client list
+priority: 100
+enabled: true
+probe:
+  type: router_name
+result:
+  device_type: router-dhcp
+  auto_guess: "{router_name}"
+  note: name from router list

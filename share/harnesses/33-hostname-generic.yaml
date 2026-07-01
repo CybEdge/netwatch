@@ -1,0 +1,12 @@
+id: hostname-generic
+name: Any mDNS hostname
+priority: 50
+enabled: true
+when:
+  hostname_present: true
+probe:
+  type: hostname_map
+result:
+  device_type: named
+  auto_guess: "{hostname_short}"
+  note: "{hostname}"

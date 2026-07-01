@@ -1,0 +1,16 @@
+id: hostname-nas
+name: NAS hostname
+priority: 78
+enabled: true
+when:
+  hostname_contains_any:
+    - nas
+    - synology
+    - diskstation
+    - qnap
+probe:
+  type: hostname_map
+result:
+  device_type: nas
+  auto_guess: "{hostname_short}"
+  note: "{hostname}"

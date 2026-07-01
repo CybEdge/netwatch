@@ -1,0 +1,20 @@
+# mDNS / DNS hostname keyword matches
+id: hostname-apple
+name: Apple hostname
+priority: 80
+enabled: true
+when:
+  hostname_contains_any:
+    - iphone
+    - ipad
+    - ipod
+    - macbook
+    - mac-mini
+    - imac
+    - apple
+probe:
+  type: hostname_map
+result:
+  device_type: apple
+  auto_guess: "{hostname_short}"
+  note: "{hostname}"

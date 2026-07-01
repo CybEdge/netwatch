@@ -1,0 +1,7 @@
+[
+  {
+    "ip": "198.51.100.10",
+    "mac": "aa:bb:cc:dd:ee:ff",
+    "name": "Example device"
+  }
+]

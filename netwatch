@@ -1,0 +1,4968 @@
+#!/usr/bin/env python3
+"""Netwatch — terminal dashboard for YOUR home network (defensive monitoring).
+
+Config: ~/.config/netwatch/config.yaml
+Setup:  netwatch --configure   router username/password
+        netwatch --setup        sudo + optional systemd restore
+Keys:   r=refresh  s=scan  W/w=panel pages  O=options  B=block  G=registry  h=help  q=quit
+"""
+from __future__ import annotations
+
+import curses
+import getpass
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import smtplib
+import socket
+import subprocess
+import sys
+import threading
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from email.message import EmailMessage
+from http.cookiejar import CookieJar
+from pathlib import Path
+from typing import Any
+from urllib.error import URLError
+from urllib.parse import urlencode
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore
+
+CONFIG_DIR = Path.home() / ".config/netwatch"
+CONFIG_PATH = CONFIG_DIR / "config.yaml"
+MANUAL_PATH = CONFIG_DIR / "router-manual.json"
+BLOCKED_PATH = CONFIG_DIR / "blocked_devices.json"
+ALERT_STATE_PATH = CONFIG_DIR / "alert_state.json"
+TRUSTED_PEERS_PATH = CONFIG_DIR / "trusted_peers.json"
+SECRETS_PATH = CONFIG_DIR / "secrets.env"
+SETUP_MARKER = CONFIG_DIR / ".enforcement-ready"
+SYSTEMD_USER_UNIT = Path.home() / ".config/systemd/user/netwatch-blocks.service"
+HARNESS_DIR = CONFIG_DIR / "harnesses"
+IDLE_TIMEOUT_MS = 250
+STATUS_FLASH_SEC = 3.0
+NFT_TABLE = "netwatch"
+NFT_CHAIN_IN = "block_in"
+NFT_CHAIN_OUT = "block_out"
+__version__ = "2.0.0"
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "alerts": {
+        "enabled": True,
+        "state_file": str(CONFIG_DIR / "known_devices.json"),
+        "banner": True,
+    },
+    "identify": {
+        "auto_enrich": True,
+        "auto_probe_unknown": True,
+        "probe_interval_seconds": 300,
+        "resolve_timeout_seconds": 1,
+        "oui_cache": str(CONFIG_DIR / "oui.txt"),
+        "oui_url": "https://www.wireshark.org/download/automated/data/manuf",
+    },
+    "harnesses": {
+        "enabled": True,
+        "directory": str(HARNESS_DIR),
+        "stop_on_first_match": True,
+    },
+    "tailscale": {"enabled": True},
+    "router": {
+        "enabled": False,
+        "url": "",
+        "type": "disabled",
+        "fritzbox": {
+            "host": "",
+            "username": "admin",
+            "password_env": "FRITZBOX_PASSWORD",
+        },
+        "custom_script": str(CONFIG_DIR / "router-clients.sh"),
+    },
+    "scan": {
+        "cidr": "",
+        "extra_cidrs": [],
+        "ping_limit": 0,
+        "ping_workers": 48,
+        "methods": ["ping", "mdns"],
+        "mdns_timeout_seconds": 4,
+        "use_nmap_if_available": True,
+    },
+    "display": {
+        "refresh_seconds": 0,
+        "panels_per_page": 4,
+        "items_per_panel": 15,
+        "status_flash_seconds": 3.0,
+    },
+    "keybindings": {},
+    "prompts": {
+        "dismissed": {},
+    },
+    "notifications": {
+        "enabled": True,
+        "repeat_hours": 24,
+        "desktop": {"enabled": True},
+        "email": {
+            "enabled": False,
+            "smtp_host": "smtp.gmail.com",
+            "smtp_port": 587,
+            "use_tls": True,
+            "username_env": "NETWATCH_SMTP_USER",
+            "password_env": "NETWATCH_SMTP_PASS",
+            "from": "netwatch@home.lan",
+            "to": "",
+        },
+    },
+    "countermeasures": {
+        "enabled": True,
+        "block_file": str(BLOCKED_PATH),
+        # Quarantine runs ONLY when you press b in identify (never from cron/alerts).
+        "auto_quarantine": False,
+        # Re-apply firewall rules after reboot for devices you already blocked.
+        "restore_on_boot": True,
+        "block_by_mac": True,
+        # full = nftables + firewalld + ZTE router MAC deny when you block manually
+        "method": "full",
+        "block_script": str(CONFIG_DIR / "router-block.sh"),
+        "protect_gateway": True,
+        "protect_self": True,
+        "sudo_non_interactive": True,
+        "auto_setup": False,
+        "router_block": {
+            "enabled": True,
+            "type": "zte",
+            "host": "",
+            "username_env": "ROUTER_USER",
+            "password_env": "ROUTER_PASSWORD",
+            "mac_filter_view": "wlanMacFilter",
+            "mac_filter_data": "wlan_macfilter_lua.lua",
+        },
+    },
+    "host_exposure": {
+        "enabled": True,
+        # Sessions where another device connects TO this PC (SSH, RDP, tunnels, …)
+        "monitor_inbound": True,
+        # Bridges, VPN tunnels, Tailscale — paths that can reach your machine
+        "monitor_bridges": True,
+        # TCP/UDP ports bound on LAN or 0.0.0.0 (not localhost-only)
+        "monitor_listeners": True,
+        "trusted_peers_file": str(CONFIG_DIR / "trusted_peers.json"),
+        # Ports you intentionally expose (not flagged). Empty = flag all LAN listeners.
+        "trusted_ports": [],
+        "trusted_ips": [],
+        "banner": True,
+        "alert_inbound": True,
+        # Use passwordless sudo (from netwatch --setup) to name root-owned listeners
+        "resolve_with_sudo": True,
+    },
+}
+
+_OUI_PREFIXES: dict[str, str] | None = None
+
+
+def expand_path(value: str) -> Path:
+    return Path(os.path.expanduser(value))
+
+
+def load_config() -> dict[str, Any]:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if CONFIG_PATH.is_file() and yaml:
+        loaded = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+        for section, values in loaded.items():
+            if isinstance(values, dict) and isinstance(cfg.get(section), dict):
+                cfg[section].update(values)
+            else:
+                cfg[section] = values
+    resolve_router_hosts(cfg)
+    return cfg
+
+
+def gateway_http_url(gateway: str | None = None) -> str:
+    """Router admin base URL from default gateway (no hardcoded LAN)."""
+    if gateway is None:
+        _, gateway, _ = default_route()
+    gw = (gateway or "").strip()
+    if not gw:
+        return ""
+    if gw.startswith("http://") or gw.startswith("https://"):
+        return gw.rstrip("/")
+    return f"http://{gw}"
+
+
+def resolve_router_hosts(cfg: dict[str, Any]) -> None:
+    """Fill empty router host fields from the live default gateway."""
+    gw_url = gateway_http_url()
+    if not gw_url:
+        return
+    router = cfg.setdefault("router", {})
+    if not str(router.get("url") or "").strip():
+        router["url"] = gw_url
+    fb = router.setdefault("fritzbox", {})
+    if not str(fb.get("host") or "").strip():
+        fb["host"] = gw_url
+    rb = cfg.get("countermeasures", {}).get("router_block") or {}
+    if isinstance(rb, dict) and not str(rb.get("host") or "").strip():
+        cfg.setdefault("countermeasures", {}).setdefault("router_block", {})["host"] = gw_url
+
+
+def router_admin_url(cfg: dict[str, Any]) -> str:
+    """Best-effort router UI URL for display and API calls."""
+    router = cfg.get("router") or {}
+    rb = (cfg.get("countermeasures") or {}).get("router_block") or {}
+    for candidate in (
+        rb.get("host"),
+        router.get("url"),
+        (router.get("fritzbox") or {}).get("host"),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text.rstrip("/")
+    return gateway_http_url()
+
+
+DEFAULT_KEYBINDINGS: dict[str, tuple[str, str]] = {
+    "refresh": ("Refresh dashboard state", "r"),
+    "scan": ("House scan — full /24 + mDNS", "s"),
+    "panel_next": ("Next panel page", "W"),
+    "panel_prev": ("Previous panel page", "w"),
+    "identify": ("Identify / label devices", "i"),
+    "acknowledge": ("Acknowledge trusted MACs", "a"),
+    "block": ("Block unknown device (quarantine)", "b"),
+    "registry": ("Blocked-device registry", "g"),
+    "host_exposure": ("Host exposure detail view", "e"),
+    "trust_inbound": ("Trust inbound peers", "t"),
+    "options": ("Options & keybindings", "o"),
+    "help": ("Full help datasheet", "h"),
+    "quit": ("Quit", "q"),
+}
+
+CASE_SENSITIVE_BINDINGS = frozenset({"panel_next", "panel_prev"})
+
+
+def binding_key(cfg: dict[str, Any], action: str) -> str:
+    custom = (cfg.get("keybindings") or {}).get(action)
+    if isinstance(custom, str) and len(custom) == 1:
+        return custom
+    return DEFAULT_KEYBINDINGS[action][1]
+
+
+def binding_label(cfg: dict[str, Any], action: str) -> str:
+    key = binding_key(cfg, action)
+    if key.isalpha() and action not in CASE_SENSITIVE_BINDINGS:
+        return key.upper()
+    return key
+
+
+def binding_ch(cfg: dict[str, Any], action: str) -> int:
+    return ord(binding_key(cfg, action))
+
+
+def printable_key(ch: int) -> bool:
+    return 32 <= ch <= 126 and ch not in (127,)
+
+
+def key_matches_action(cfg: dict[str, Any], ch: int, action: str) -> bool:
+    bound = binding_ch(cfg, action)
+    if ch == bound:
+        return True
+    if action in CASE_SENSITIVE_BINDINGS:
+        return False
+    if not printable_key(ch):
+        return False
+    key = binding_key(cfg, action)
+    if key.isalpha() and chr(ch).lower() == key.lower():
+        return True
+    return False
+
+
+def action_for_key(cfg: dict[str, Any], ch: int, *, exclude: str | None = None) -> str | None:
+    for action in DEFAULT_KEYBINDINGS:
+        if action == exclude:
+            continue
+        if key_matches_action(cfg, ch, action):
+            return action
+    return None
+
+
+def set_keybinding(cfg: dict[str, Any], action: str, ch: int) -> str:
+    if not printable_key(ch):
+        return "unsupported key — use a printable character"
+    new_key = chr(ch)
+    other = action_for_key(cfg, ch, exclude=action)
+    cfg.setdefault("keybindings", {})
+    if other:
+        old = binding_key(cfg, action)
+        cfg["keybindings"][action] = new_key
+        cfg["keybindings"][other] = old
+        return f"swapped {binding_label(cfg, action)} ↔ {binding_label(cfg, other)}"
+    cfg["keybindings"][action] = new_key
+    return f"bound {DEFAULT_KEYBINDINGS[action][0]} → {binding_label(cfg, action)}"
+
+
+def binding_rows(cfg: dict[str, Any]) -> list[tuple[str, str, str]]:
+    return [
+        (action, binding_label(cfg, action), DEFAULT_KEYBINDINGS[action][0])
+        for action in DEFAULT_KEYBINDINGS
+    ]
+
+
+def dashboard_status_legend(cfg: dict[str, Any]) -> str:
+    pn = binding_label(cfg, "panel_next")
+    pp = binding_label(cfg, "panel_prev")
+    return (
+        f"{pn}/{pp} panels · "
+        f"{binding_label(cfg, 'options')} opts · "
+        f"{binding_label(cfg, 'block')} block · "
+        f"{binding_label(cfg, 'registry')} list · "
+        f"{binding_label(cfg, 'refresh')} sync · "
+        f"{binding_label(cfg, 'help')} help"
+    )
+
+
+def dashboard_footer_keys(cfg: dict[str, Any]) -> str:
+    pn = binding_label(cfg, "panel_next")
+    pp = binding_label(cfg, "panel_prev")
+    return (
+        f" {pn}/{pp}·panels  "
+        f"{binding_label(cfg, 'options')}·opts  "
+        f"{binding_label(cfg, 'block')}·block  "
+        f"{binding_label(cfg, 'registry')}·list  "
+        f"{binding_label(cfg, 'refresh')}·sync  "
+        f"{binding_label(cfg, 'help')}·?  "
+        f"{binding_label(cfg, 'quit')}·exit "
+    )
+
+
+def help_lines(cfg: dict[str, Any]) -> list[str]:
+    router_ui = router_admin_url(cfg) or "http://<your-gateway>"
+    return [
+        "NETWATCH // NEURAL OPS DATASHEET",
+        "",
+        "── Probe harnesses (no code changes needed) ──",
+        "  Drop YAML files in ~/.config/netwatch/harnesses/",
+        "  Press r to reload config + harnesses after edits.",
+        "",
+        "  Built-in harness types (see harnesses/*.yaml):",
+        "    router_name   name from router client list",
+        "    http_json     HTTP API + JSON path matching (Samsung TV, etc.)",
+        "    hostname_map  mDNS/DNS name keywords",
+        "    tcp_map       open-port fingerprint (phones, Cast, …)",
+        "    vendor_map    MAC vendor rules",
+        "    script        run your own probe; print JSON to stdout",
+        "    static        fixed fallback result",
+        "",
+        "  Custom script harness example:",
+        "    harnesses/examples/example-probe.sh",
+        "  Script env: NETWATCH_IP, NETWATCH_MAC, NETWATCH_HOSTNAME, …",
+        "  Script output: {\"matched\":true,\"auto_guess\":\"…\",\"device_type\":\"…\"}",
+        "",
+        "── Identify mode (i) ──",
+        "    n   run full probe on all unknown devices",
+        "    l   label a device (row #, then name) — no longer hangs",
+        "    m   import names from router-manual.json",
+        "    r   refresh list only (fast, no network)",
+        "    q   return to dashboard",
+        "",
+        "  Workflow to name everything:",
+        "    1. Press s to ping-sweep LAN (finds sleeping devices)",
+        "    2. Press i → n to resolve names",
+        "    3. Press l on each row — e.g. 'my phone', 'Smart TV'",
+        f"    4. Cross-check {router_ui} router UI",
+        "    5. Press a on dashboard to acknowledge trusted MACs",
+        "",
+        "── Keys (dashboard) ──",
+        f"  {binding_label(cfg, 'refresh')}   refresh (ARP + cached data)",
+        f"  {binding_label(cfg, 'scan')}   house scan — full /24 ping + mDNS (+ nmap if installed)",
+        f"  {binding_label(cfg, 'identify')}   identify / label devices",
+        f"  {binding_label(cfg, 'acknowledge')}   acknowledge trusted MACs",
+        f"  {binding_label(cfg, 'block')}   block unknown device (countermeasure)",
+        f"  {binding_label(cfg, 'registry')}   blocked-device registry",
+        f"  {binding_label(cfg, 'panel_next')}   next panel page · {binding_label(cfg, 'panel_prev')} previous",
+        f"  {binding_label(cfg, 'options')}   options & keybindings (tab→keys pane, space rebind, s save)",
+        f"  {binding_label(cfg, 'host_exposure')}   host exposure detail · {binding_label(cfg, 'trust_inbound')} trust inbound peers",
+        f"  {binding_label(cfg, 'help')}   help   {binding_label(cfg, 'quit')}   quit",
+        "  LAN panel = ARP cache on THIS PC (recently active, same subnet).",
+        "  Repeaters on one SSID usually share the same gateway subnet.",
+        "  Sleeping phones or AP-isolation on extenders may hide until active.",
+        "  Press s for HOUSE SCAN: pings ALL .1-.254 + mDNS browse (best effort).",
+        "  Add scan.extra_cidrs in config if a repeater uses another subnet.",
+        "  Router device list = names from router-manual.json + script.",
+        "  Tip: sudo dnf install nmap for faster discovery (optional).",
+        "",
+        "── Config files ──",
+        f"  config.yaml:       {CONFIG_PATH}",
+        f"  known_devices:     {cfg['alerts']['state_file']}",
+        f"  router-manual:     {MANUAL_PATH}",
+        f"  vendor database:   {cfg['identify']['oui_cache']}",
+        f"  probe harnesses:   {cfg['harnesses']['directory']}",
+        "",
+        "── Alerts ──",
+        "  Unknown MAC → red banner. Verify in identify mode, then press a.",
+        "",
+        "── Countermeasures ──",
+        "  netwatch --configure   router username/password (secrets.env, chmod 600)",
+        "  netwatch --setup once (sudo for firewall + process names; never auto-runs).",
+        "  B   block unknown device (cut + registry + router deny)",
+        "  G   quarantine registry — view blocked list, X·unblock",
+        "  Blocks persist in blocked_devices.json; restore_on_boot re-applies.",
+        "  Layers: PC firewall (IP+MAC) + ZTE router Wi‑Fi deny when configured.",
+        "  identify → b block row · x unblock row.",
+        "",
+        "── Router device list panel ──",
+        "  Devices reported by your router script (router-clients.sh) plus",
+        f"  names you add in router-manual.json — cross-check with {router_ui} UI.",
+        "",
+        "── Router / Tailscale ──",
+        "  router.type: custom | fritzbox | disabled",
+        "  Fritz!Box: export FRITZBOX_PASSWORD='…'",
+        "  tailscale.enabled: uses `tailscale status --json`",
+        "",
+        "── Host exposure (this PC) ──",
+        "  Netwatch also watches who reaches YOU — not just LAN neighbors.",
+        "  Inbound panel: remote IP → your listening port (SSH, SMB, …).",
+        "  Bridges/tunnels: docker0, tailscale0, virbr — paths into this box.",
+        "  Exposed listeners: resolved live from ss/lsof (any new port auto-detected).",
+        "  Root-owned services need one-time: netwatch --setup (sudo ss/lsof, not hardcoded).",
+        "  e   host exposure detail   T   trust current inbound peers",
+        "  In detail view: d + port to re-resolve a listener.",
+        "  CLI: netwatch --dig-listeners   netwatch --dig-port PORT",
+        "",
+        "── Defense ──",
+        "  firewall on • updates • WPA2/WPA3 • no WPS • 2FA • Tailscale not port-forward",
+        "",
+        "Press any key to return…",
+    ]
+
+
+@dataclass
+class LanDevice:
+    ip: str
+    mac: str
+    state: str
+    is_new: bool = False
+    label: str = ""
+    hostname: str = ""
+    vendor: str = ""
+    guess: str = ""
+    notes: str = ""
+
+
+@dataclass
+class RouterClient:
+    ip: str
+    mac: str
+    name: str
+
+
+@dataclass
+class TailscalePeer:
+    name: str
+    ip: str
+    online: bool
+    last_seen: str
+
+
+@dataclass
+class BlockedEntry:
+    mac: str
+    last_ip: str
+    label: str = ""
+    reason: str = ""
+    blocked_at: str = ""
+    method: str = ""
+    online: bool = False
+    last_ping: str = ""
+
+
+@dataclass
+class OutboundFlow:
+    connection: str
+    name: str
+    notes: str
+
+
+@dataclass
+class InboundFlow:
+    connection: str
+    remote_ip: str
+    name: str
+    service: str
+    proc: str
+    is_new: bool = False
+
+
+@dataclass
+class BridgeLink:
+    name: str
+    state: str
+    note: str
+
+
+@dataclass
+class ExposedListener:
+    bind: str
+    port: str
+    proc: str
+    risk: str
+    pid: str = ""
+    proto: str = ""
+    detail: str = ""
+
+
+def format_listener_label(entry: ExposedListener) -> str:
+    if entry.proc:
+        label = entry.proc
+        if entry.pid:
+            label += f"·{entry.pid}"
+        return label
+    if entry.detail and entry.detail != "unidentified":
+        return entry.detail
+    return "unidentified"
+
+
+@dataclass
+class DashboardState:
+    devices: list[LanDevice] = field(default_factory=list)
+    new_macs: list[str] = field(default_factory=list)
+    blocked: list[BlockedEntry] = field(default_factory=list)
+    outbound: list[OutboundFlow] = field(default_factory=list)
+    inbound: list[InboundFlow] = field(default_factory=list)
+    new_inbound: list[str] = field(default_factory=list)
+    bridges: list[BridgeLink] = field(default_factory=list)
+    exposed: list[ExposedListener] = field(default_factory=list)
+    login_sessions: list[str] = field(default_factory=list)
+    tailscale: list[TailscalePeer] = field(default_factory=list)
+    router_clients: list[RouterClient] = field(default_factory=list)
+    router_note: str = ""
+    status: str = "ready"
+
+
+def run(cmd: list[str], timeout: int = 8) -> str:
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+        return (proc.stdout or proc.stderr or "").strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, KeyboardInterrupt):
+        return ""
+
+
+def default_route() -> tuple[str, str, str]:
+    out = run(["ip", "route", "show", "default"])
+    iface = gateway = ""
+    m = re.search(r"default via (\S+) dev (\S+)", out)
+    if m:
+        gateway, iface = m.group(1), m.group(2)
+    local = ""
+    if iface:
+        addr = run(["ip", "-4", "-br", "addr", "show", "dev", iface])
+        m2 = re.search(r"(\d+\.\d+\.\d+\.\d+)", addr)
+        if m2:
+            local = m2.group(1)
+    return iface, gateway, local
+
+
+def parse_neigh(iface: str) -> list[LanDevice]:
+    devices: list[LanDevice] = []
+    out = run(["ip", "neigh", "show", "dev", iface])
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[0].count(".") != 3 or parts[1] != "lladdr":
+            continue
+        ip, mac, state = parts[0], parts[2].lower(), parts[-1]
+        if mac == "failed":
+            continue
+        devices.append(LanDevice(ip=ip, mac=mac, state=state))
+    devices.sort(key=lambda d: ipaddress.ip_address(d.ip))
+    return devices
+
+
+def is_random_mac(mac: str) -> bool:
+    try:
+        first = int(mac.split(":")[0], 16)
+    except ValueError:
+        return False
+    return bool(first & 0x02)
+
+
+def ensure_oui_cache(cfg: dict[str, Any]) -> Path:
+    cache = expand_path(cfg["identify"]["oui_cache"])
+    if cache.is_file() and cache.stat().st_size > 1000:
+        return cache
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    url = cfg["identify"].get(
+        "oui_url", "https://www.wireshark.org/download/automated/data/manuf"
+    )
+    try:
+        with urlopen(url, timeout=30) as resp:
+            cache.write_bytes(resp.read())
+    except URLError:
+        pass
+    return cache
+
+
+def load_oui_prefixes(cfg: dict[str, Any]) -> dict[str, str]:
+    global _OUI_PREFIXES
+    if _OUI_PREFIXES is not None:
+        return _OUI_PREFIXES
+    prefixes: dict[str, str] = {}
+    for candidate in (
+        expand_path(cfg["identify"]["oui_cache"]),
+        Path("/usr/share/nmap/nmap-mac-prefixes"),
+        Path("/usr/share/wireshark/manuf"),
+    ):
+        if candidate.is_file():
+            for line in candidate.read_text(errors="replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(None, 2)
+                if len(parts) >= 2 and ":" in parts[0]:
+                    prefixes[parts[0].upper().replace("-", ":")] = parts[1]
+            if prefixes:
+                _OUI_PREFIXES = prefixes
+                return prefixes
+    ensure_oui_cache(cfg)
+    return load_oui_prefixes(cfg) if expand_path(cfg["identify"]["oui_cache"]).is_file() else {}
+
+
+def lookup_vendor(mac: str, cfg: dict[str, Any]) -> str:
+    prefixes = load_oui_prefixes(cfg)
+    mac = mac.upper()
+    for width in (8, 7, 6):
+        key = mac[:width]
+        if key in prefixes:
+            return prefixes[key]
+    return ""
+
+
+def resolve_hostname(ip: str, timeout: float = 1.0) -> str:
+    t = max(1, int(timeout))
+    if shutil.which("avahi-resolve"):
+        out = run(["avahi-resolve", "-a", ip], timeout=t)
+        if out and "\t" in out:
+            name = out.split("\t", 1)[1].strip()
+            if name and name != ip:
+                return name
+    old = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(timeout)
+        name, _, _ = socket.gethostbyaddr(ip)
+        if name and name != ip:
+            return name
+    except OSError:
+        pass
+    finally:
+        socket.setdefaulttimeout(old)
+    return ""
+
+
+def probe_tcp_port(ip: str, port: int, timeout: float = 0.35) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+@dataclass
+class ProbeResult:
+    matched: bool
+    device_type: str = ""
+    auto_guess: str = ""
+    note: str = ""
+    harness_id: str = ""
+    confidence: float = 0.0
+
+
+def html_unescape(text: str) -> str:
+    return (
+        text.replace("&quot;", '"')
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+    )
+
+
+def json_path(data: Any, path: str) -> Any:
+    cur = data
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def build_probe_context(
+    dev: LanDevice,
+    router_by_ip: dict[str, str],
+    json_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    hostname = (dev.hostname or "").strip()
+    short = hostname.split(".")[0] if hostname else ""
+    router_name = (router_by_ip.get(dev.ip) or "").strip()
+    ctx: dict[str, Any] = {
+        "ip": dev.ip,
+        "mac": dev.mac,
+        "hostname": hostname,
+        "hostname_short": short,
+        "hostname_lower": hostname.lower(),
+        "vendor": dev.vendor or "",
+        "router_name": router_name,
+        "random_mac": is_random_mac(dev.mac),
+        "json": json_data or {},
+    }
+    if json_data:
+        for key, value in json_data.items():
+            if isinstance(value, (str, int, float, bool)):
+                ctx[key] = value
+    return ctx
+
+
+def render_probe_template(text: str, ctx: dict[str, Any]) -> str:
+    if not text:
+        return ""
+
+    def repl(match: re.Match[str]) -> str:
+        key = match.group(1).strip()
+        if key in ctx and ctx[key] is not None:
+            val = ctx[key]
+        else:
+            val = json_path(ctx.get("json", {}), key)
+        return "" if val is None else str(val)
+
+    return re.sub(r"\{([^}]+)\}", repl, text)
+
+
+def harness_when_matches(when: dict[str, Any], dev: LanDevice, ctx: dict[str, Any]) -> bool:
+    if not when:
+        return True
+    if when.get("random_mac") is True and not ctx["random_mac"]:
+        return False
+    if when.get("random_mac") is False and ctx["random_mac"]:
+        return False
+    if when.get("hostname_empty") and ctx["hostname"]:
+        return False
+    if when.get("hostname_present") and not ctx["hostname"]:
+        return False
+    if when.get("vendor_present") and not ctx["vendor"]:
+        return False
+    port = when.get("port_open")
+    if port is not None and not probe_tcp_port(dev.ip, int(port)):
+        return False
+    any_ports = when.get("any_port_open") or when.get("any_port")
+    if any_ports:
+        if not any(probe_tcp_port(dev.ip, int(p)) for p in any_ports):
+            return False
+    keywords = when.get("hostname_contains_any") or []
+    if keywords:
+        host = ctx["hostname_lower"]
+        if not host or not any(k.lower() in host for k in keywords):
+            return False
+    return True
+
+
+def load_harnesses(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    if not cfg.get("harnesses", {}).get("enabled", True):
+        return []
+    directory = expand_path(cfg["harnesses"].get("directory") or str(HARNESS_DIR))
+    if not directory.is_dir() or yaml is None:
+        return []
+    harnesses: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.yaml")) + sorted(directory.glob("*.yml")):
+        try:
+            doc = yaml.safe_load(path.read_text()) or {}
+        except Exception:
+            continue
+        if not isinstance(doc, dict) or doc.get("enabled", True) is False:
+            continue
+        doc["_path"] = str(path)
+        doc.setdefault("priority", 0)
+        doc.setdefault("id", path.stem)
+        harnesses.append(doc)
+    harnesses.sort(key=lambda h: int(h.get("priority") or 0), reverse=True)
+    return harnesses
+
+
+def run_probe_harness(
+    harness: dict[str, Any],
+    dev: LanDevice,
+    router_by_ip: dict[str, str],
+) -> ProbeResult:
+    hid = str(harness.get("id") or "?")
+    when = harness.get("when") or {}
+    probe = harness.get("probe") or {}
+    result_tpl = harness.get("result") or {}
+    ctx = build_probe_context(dev, router_by_ip)
+    if not harness_when_matches(when, dev, ctx):
+        return ProbeResult(matched=False, harness_id=hid)
+
+    ptype = (probe.get("type") or "static").lower()
+    json_data: dict[str, Any] | None = None
+
+    if ptype == "router_name":
+        if not ctx["router_name"] or ctx["router_name"] in ("?", "arp-neighbor"):
+            return ProbeResult(matched=False, harness_id=hid)
+        ctx["matched"] = True
+    elif ptype == "hostname_map":
+        if not ctx["hostname"]:
+            return ProbeResult(matched=False, harness_id=hid)
+    elif ptype == "http_json":
+        url = render_probe_template(str(probe.get("url") or ""), ctx)
+        if not url:
+            return ProbeResult(matched=False, harness_id=hid)
+        timeout = float(probe.get("timeout") or 1.5)
+        try:
+            with urlopen(url, timeout=timeout) as resp:
+                json_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except (URLError, json.JSONDecodeError, TimeoutError, OSError):
+            return ProbeResult(matched=False, harness_id=hid)
+        ctx = build_probe_context(dev, router_by_ip, json_data if isinstance(json_data, dict) else {})
+        for rule in harness.get("match") or []:
+            val = json_path(ctx["json"], str(rule.get("path") or ""))
+            expected = rule.get("equals")
+            if expected is not None and str(val) != str(expected):
+                return ProbeResult(matched=False, harness_id=hid)
+    elif ptype == "tcp_map":
+        timeout = float(probe.get("timeout") or 0.35)
+        ports = probe.get("ports") or {}
+        for port_str, spec in ports.items():
+            if probe_tcp_port(dev.ip, int(port_str), timeout):
+                result_tpl = spec if isinstance(spec, dict) else result_tpl
+                break
+        else:
+            result_tpl = probe.get("default") or result_tpl
+    elif ptype == "vendor_map":
+        vendor = (dev.vendor or "").lower()
+        if not vendor:
+            return ProbeResult(matched=False, harness_id=hid)
+        matched_rule = None
+        for rule in probe.get("rules") or []:
+            if str(rule.get("contains") or "").lower() in vendor:
+                matched_rule = rule
+                break
+        result_tpl = matched_rule or probe.get("default") or result_tpl
+        if not matched_rule and not probe.get("default"):
+            return ProbeResult(matched=False, harness_id=hid)
+    elif ptype == "script":
+        script = expand_path(str(probe.get("path") or ""))
+        if not script.is_file():
+            return ProbeResult(matched=False, harness_id=hid, note=f"missing script {script}")
+        env = os.environ.copy()
+        env.update(
+            {
+                "NETWATCH_IP": dev.ip,
+                "NETWATCH_MAC": dev.mac,
+                "NETWATCH_HOSTNAME": dev.hostname or "",
+                "NETWATCH_VENDOR": dev.vendor or "",
+            }
+        )
+        try:
+            proc = subprocess.run(
+                [str(script)],
+                capture_output=True,
+                text=True,
+                timeout=int(probe.get("timeout") or 10),
+                check=False,
+                env=env,
+            )
+            payload = json.loads((proc.stdout or "").strip() or "{}")
+        except (json.JSONDecodeError, subprocess.TimeoutExpired):
+            return ProbeResult(matched=False, harness_id=hid)
+        if not payload.get("matched"):
+            return ProbeResult(matched=False, harness_id=hid)
+        return ProbeResult(
+            matched=True,
+            harness_id=hid,
+            device_type=str(payload.get("device_type") or ""),
+            auto_guess=str(payload.get("auto_guess") or ""),
+            note=str(payload.get("note") or ""),
+            confidence=float(payload.get("confidence") or 0.8),
+        )
+    elif ptype != "static":
+        return ProbeResult(matched=False, harness_id=hid, note=f"unknown probe type {ptype}")
+
+    transforms = result_tpl if isinstance(result_tpl, dict) else (harness.get("result") or {})
+    auto_guess = render_probe_template(str(transforms.get("auto_guess") or ""), ctx)
+    note = render_probe_template(str(transforms.get("note") or ""), ctx)
+    device_type = render_probe_template(str(transforms.get("device_type") or ""), ctx)
+    transform = transforms.get("transform") or (harness.get("result") or {}).get("transform") or {}
+    if transform.get("auto_guess") == "html_unescape":
+        auto_guess = html_unescape(auto_guess)
+
+    if not auto_guess and not device_type and ptype != "static":
+        return ProbeResult(matched=False, harness_id=hid)
+
+    return ProbeResult(
+        matched=True,
+        harness_id=hid,
+        device_type=device_type,
+        auto_guess=auto_guess,
+        note=note or hid,
+        confidence=float(transforms.get("confidence") or (harness.get("result") or {}).get("confidence") or 0.7),
+    )
+
+
+def run_probe_harnesses(
+    dev: LanDevice,
+    router_by_ip: dict[str, str],
+    cfg: dict[str, Any],
+) -> tuple[str, str, str, str]:
+    """Return device_type, auto_guess, note, harness_id."""
+    harnesses = load_harnesses(cfg)
+    stop_first = cfg.get("harnesses", {}).get("stop_on_first_match", True)
+    best = ProbeResult(matched=False)
+    for harness in harnesses:
+        result = run_probe_harness(harness, dev, router_by_ip)
+        if not result.matched:
+            continue
+        if stop_first:
+            return result.device_type, result.auto_guess, result.note, result.harness_id
+        if result.confidence >= best.confidence:
+            best = result
+    if best.matched:
+        return best.device_type, best.auto_guess, best.note, best.harness_id
+    return "unknown", "unknown device", "no harness matched", ""
+
+
+def auto_probe_device(
+    dev: LanDevice,
+    router_by_ip: dict[str, str],
+    cfg: dict[str, Any],
+) -> tuple[str, str, str]:
+    dtype, guess, note, _hid = run_probe_harnesses(dev, router_by_ip, cfg)
+    return dtype, guess, note
+
+
+def load_known(path: Path) -> dict[str, dict]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_known(path: Path, known: dict[str, dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(known, indent=2, sort_keys=True) + "\n")
+
+
+def load_manual_map() -> dict[str, dict]:
+    if not MANUAL_PATH.is_file():
+        return {}
+    try:
+        items = json.loads(MANUAL_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+    by_mac: dict[str, dict] = {}
+    for item in items if isinstance(items, list) else []:
+        mac = str(item.get("mac", "")).lower()
+        if mac:
+            by_mac[mac] = item
+    return by_mac
+
+
+def save_manual_from_known(known: dict[str, dict]) -> None:
+    rows = []
+    for mac, entry in sorted(known.items()):
+        label = (entry.get("label") or "").strip()
+        if not label:
+            continue
+        rows.append(
+            {
+                "ip": entry.get("last_ip", "?"),
+                "mac": mac,
+                "name": label,
+            }
+        )
+    MANUAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MANUAL_PATH.write_text(json.dumps(rows, indent=2) + "\n")
+
+
+def set_device_label(cfg: dict[str, Any], mac: str, label: str) -> None:
+    mac = mac.lower()
+    known_path = expand_path(cfg["alerts"]["state_file"])
+    known = load_known(known_path)
+    entry = known.get(mac, {})
+    entry["label"] = label.strip()
+    entry.setdefault("first_seen", time.strftime("%Y-%m-%dT%H:%M:%S"))
+    entry["last_seen"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    known[mac] = entry
+    save_known(known_path, known)
+    save_manual_from_known(known)
+
+
+def merge_manual_labels(cfg: dict[str, Any]) -> int:
+    known_path = expand_path(cfg["alerts"]["state_file"])
+    known = load_known(known_path)
+    manual = load_manual_map()
+    merged = 0
+    for mac, item in manual.items():
+        name = str(item.get("name", "")).strip()
+        if not name or name in ("arp-neighbor", "?"):
+            continue
+        entry = known.setdefault(mac, {})
+        if not (entry.get("label") or "").strip():
+            entry["label"] = name
+            merged += 1
+        known[mac] = entry
+    save_known(known_path, known)
+    return merged
+
+
+def enrich_devices(
+    devices: list[LanDevice],
+    known: dict[str, dict],
+    router_clients: list[RouterClient],
+    cfg: dict[str, Any],
+    *,
+    force_refresh: bool = False,
+    network: bool = True,
+) -> None:
+    _, gateway, _ = default_route()
+    router_by_mac = {c.mac.lower(): c.name for c in router_clients}
+    router_by_ip = {
+        c.ip: c.name
+        for c in router_clients
+        if c.ip.count(".") == 3 and c.name not in ("?", "arp-neighbor")
+    }
+    auto = cfg.get("identify", {}).get("auto_enrich", True)
+    auto_probe = cfg.get("identify", {}).get("auto_probe_unknown", True)
+    probe_interval = int(cfg.get("identify", {}).get("probe_interval_seconds") or 300)
+    resolve_timeout = float(cfg.get("identify", {}).get("resolve_timeout_seconds") or 1.0)
+    now_ts = time.time()
+    now_str = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    for dev in devices:
+        entry = known.get(dev.mac, {})
+        dev.label = (entry.get("label") or "").strip()
+        dev.hostname = (entry.get("hostname") or "").strip()
+        dev.vendor = (entry.get("vendor") or "").strip()
+        auto_guess = (entry.get("auto_guess") or "").strip()
+        device_type = (entry.get("device_type") or "").strip()
+
+        if not dev.label and dev.mac in router_by_mac:
+            name = router_by_mac[dev.mac]
+            if name not in ("?", "arp-neighbor"):
+                dev.label = name
+
+        if network and auto:
+            if force_refresh or not dev.hostname:
+                host = resolve_hostname(dev.ip, resolve_timeout)
+                if host:
+                    dev.hostname = host
+                    entry["hostname"] = host
+
+            if force_refresh or (not dev.vendor and not is_random_mac(dev.mac)):
+                vendor = lookup_vendor(dev.mac, cfg)
+                if vendor:
+                    dev.vendor = vendor
+                    entry["vendor"] = vendor
+
+        probed_at = float(entry.get("probed_at") or 0)
+        unknown = not dev.label
+        stale = (now_ts - probed_at) > probe_interval
+        should_probe = auto_probe and unknown and network and (
+            force_refresh or dev.is_new or stale or not auto_guess
+        )
+
+        if should_probe:
+            dtype, guess, probe_note, harness_id = run_probe_harnesses(
+                dev, router_by_ip, cfg
+            )
+            if guess and (force_refresh or not auto_guess):
+                auto_guess = guess
+            elif guess and not auto_guess:
+                auto_guess = guess
+            if dtype:
+                device_type = dtype
+            entry["auto_guess"] = auto_guess
+            entry["device_type"] = device_type
+            entry["probe_note"] = probe_note
+            entry["harness_id"] = harness_id
+            entry["probed_at"] = now_ts
+
+        notes: list[str] = []
+        if dev.ip == gateway:
+            notes.append("gateway")
+        if is_random_mac(dev.mac):
+            notes.append("random MAC")
+        if dev.is_new:
+            notes.append("NEW")
+        if device_type and not dev.label:
+            notes.append(device_type)
+        probe_note = (entry.get("probe_note") or "").strip()
+        if probe_note and probe_note not in notes and len(notes) < 4:
+            notes.append(probe_note[:24])
+        dev.notes = ", ".join(notes)
+
+        short_host = dev.hostname.split(".")[0] if dev.hostname else ""
+        dev.guess = dev.label or auto_guess or short_host or dev.vendor or "unknown device"
+        entry["last_ip"] = dev.ip
+        entry["last_seen"] = now_str
+        known[dev.mac] = entry
+
+
+def update_known(
+    known: dict[str, dict], devices: list[LanDevice], acknowledge: bool
+) -> tuple[list[str], dict[str, dict]]:
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    new_macs: list[str] = []
+    for dev in devices:
+        entry = known.get(dev.mac, {})
+        if not entry:
+            new_macs.append(dev.mac)
+            if acknowledge:
+                known[dev.mac] = {
+                    "first_seen": now,
+                    "last_seen": now,
+                    "last_ip": dev.ip,
+                    "label": dev.label,
+                    "hostname": dev.hostname,
+                    "vendor": dev.vendor,
+                }
+        else:
+            entry["last_seen"] = now
+            entry["last_ip"] = dev.ip
+            if dev.label:
+                entry["label"] = dev.label
+            if dev.hostname:
+                entry["hostname"] = dev.hostname
+            if dev.vendor:
+                entry["vendor"] = dev.vendor
+            known[dev.mac] = entry
+    if acknowledge:
+        for dev in devices:
+            if dev.mac not in known:
+                known[dev.mac] = {
+                    "first_seen": now,
+                    "last_seen": now,
+                    "last_ip": dev.ip,
+                    "label": dev.label,
+                    "hostname": dev.hostname,
+                    "vendor": dev.vendor,
+                }
+        new_macs = []
+    return new_macs, known
+
+
+def scan_cidrs(cfg: dict[str, Any], local_ip: str) -> list[str]:
+    primary = cfg.get("scan", {}).get("cidr") or str(
+        ipaddress.ip_network(f"{local_ip}/24", strict=False)
+    )
+    cidrs = [primary]
+    for extra in cfg.get("scan", {}).get("extra_cidrs") or []:
+        if extra and extra not in cidrs:
+            cidrs.append(str(extra))
+    return cidrs
+
+
+def ping_host(ip: str, iface: str) -> str | None:
+    code = subprocess.call(
+        ["ping", "-c", "1", "-W", "1", "-I", iface, ip],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return ip if code == 0 else None
+
+
+def ping_sweep(cidr: str, iface: str, limit: int, workers: int = 48) -> set[str]:
+    alive: set[str] = set()
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return alive
+    hosts = [str(h) for h in net.hosts()]
+    if limit and limit > 0:
+        hosts = hosts[:limit]
+    workers = max(1, min(workers, 64))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(ping_host, ip, iface) for ip in hosts]
+        for fut in as_completed(futures):
+            ip = fut.result()
+            if ip:
+                alive.add(ip)
+    return alive
+
+
+def mdns_discover(timeout: int = 4) -> dict[str, str]:
+    """Return {ip: hostname} from avahi-browse."""
+    if not shutil.which("avahi-browse"):
+        return {}
+    try:
+        proc = subprocess.run(
+            ["avahi-browse", "-a", "-r", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=max(2, timeout),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {}
+    found: dict[str, str] = {}
+    current_name = ""
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("="):
+            parts = line.split(";")
+            if len(parts) >= 4:
+                current_name = parts[3].strip()
+        elif "address =" in line:
+            m = re.search(r"\[(\d+\.\d+\.\d+\.\d+)\]", line)
+            if m:
+                ip = m.group(1)
+                found[ip] = current_name or found.get(ip, "")
+        elif line.startswith("+") and "IPv4" in line:
+            parts = line.split(";")
+            if len(parts) >= 4:
+                current_name = parts[3].strip()
+    return found
+
+
+def nmap_discover(cidr: str) -> set[str]:
+    if not shutil.which("nmap"):
+        return set()
+    out = run(["nmap", "-sn", "-T4", "--max-retries", "1", cidr], timeout=180)
+    alive: set[str] = set()
+    for line in out.splitlines():
+        m = re.search(r"Nmap scan report for (?:.* \()?(\d+\.\d+\.\d+\.\d+)", line)
+        if not m:
+            m = re.search(r"Nmap scan report for (\d+\.\d+\.\d+\.\d+)", line)
+        if m:
+            alive.add(m.group(1))
+    return alive
+
+
+def house_scan(cfg: dict[str, Any], iface: str, local_ip: str) -> tuple[set[str], str]:
+    """Discover devices across configured subnets. Returns (ips, summary)."""
+    methods = [str(m).lower() for m in (cfg.get("scan", {}).get("methods") or ["ping", "mdns"])]
+    limit = int(cfg.get("scan", {}).get("ping_limit") or 0)
+    workers = int(cfg.get("scan", {}).get("ping_workers") or 48)
+    mdns_timeout = int(cfg.get("scan", {}).get("mdns_timeout_seconds") or 4)
+    use_nmap = cfg.get("scan", {}).get("use_nmap_if_available", True)
+
+    all_ips: set[str] = set()
+    parts: list[str] = []
+
+    cidrs = scan_cidrs(cfg, local_ip)
+    if "ping" in methods:
+        ping_hits: set[str] = set()
+        for cidr in cidrs:
+            ping_hits |= ping_sweep(cidr, iface, limit, workers)
+        all_ips |= ping_hits
+        parts.append(f"ping {len(ping_hits)}")
+
+    if "mdns" in methods:
+        mdns = mdns_discover(mdns_timeout)
+        all_ips |= set(mdns.keys())
+        parts.append(f"mdns {len(mdns)}")
+
+    if use_nmap and shutil.which("nmap"):
+        nmap_hits: set[str] = set()
+        for cidr in cidrs:
+            nmap_hits |= nmap_discover(cidr)
+        all_ips |= nmap_hits
+        parts.append(f"nmap {len(nmap_hits)}")
+
+    # Wake ARP entries for anything we found but PC has not talked to yet.
+    for ip in sorted(all_ips):
+        if ip != local_ip:
+            subprocess.call(
+                ["ping", "-c", "1", "-W", "1", "-I", iface, ip],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+    summary = f"house scan: {len(all_ips)} hosts ({', '.join(parts) or 'none'})"
+    return all_ips, summary
+
+
+def tailscale_peers() -> tuple[list[TailscalePeer], str]:
+    if not shutil.which("tailscale"):
+        return [], "tailscale CLI not installed"
+    raw = run(["tailscale", "status", "--json"], timeout=10)
+    if not raw:
+        return [], "tailscale status failed"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return [], "invalid tailscale JSON"
+    peers: list[TailscalePeer] = []
+    for peer in data.get("Peer", {}).values():
+        ips = peer.get("TailscaleIPs") or []
+        ip = ips[0] if ips else "?"
+        peers.append(
+            TailscalePeer(
+                name=(peer.get("HostName") or peer.get("DNSName") or "?").strip(),
+                ip=ip,
+                online=bool(peer.get("Online")),
+                last_seen=(peer.get("LastSeen") or "")[:19].replace("T", " "),
+            )
+        )
+    peers.sort(key=lambda p: (not p.online, p.name.lower()))
+    note = f"{sum(1 for p in peers if p.online)} online / {len(peers)} peers"
+    self_ips = (data.get("Self") or {}).get("TailscaleIPs") or []
+    if self_ips:
+        note = f"this node {self_ips[0]} | {note}"
+    return peers, note
+
+
+def fritzbox_hosts(cfg: dict[str, Any]) -> tuple[list[RouterClient], str]:
+    fb = cfg["router"]["fritzbox"]
+    host = (fb.get("host") or cfg.get("router", {}).get("url") or router_admin_url(cfg) or "").rstrip("/")
+    if not host:
+        return [], "router host unknown — set router.url or check default route"
+    user = fb.get("username", "admin")
+    env_name = fb.get("password_env", "FRITZBOX_PASSWORD")
+    password = os.environ.get(env_name, "")
+    if not password:
+        return [], f"set {env_name} for Fritz!Box login"
+    try:
+        with urlopen(f"{host}/login_sid.lua", timeout=5) as resp:
+            sid_root = ET.fromstring(resp.read())
+        sid = sid_root.findtext("SID") or ""
+        challenge = sid_root.findtext("Challenge") or ""
+        if sid == "0000000000000000" and challenge:
+            response = f"{challenge}-{hashlib.md5(f'{challenge}-{password}'.encode()).hexdigest()}"
+            with urlopen(f"{host}/login_sid.lua?username={user}&response={response}", timeout=5) as resp:
+                sid = ET.fromstring(resp.read()).findtext("SID") or ""
+        if not sid or sid == "0000000000000000":
+            return [], "Fritz!Box login failed"
+        soap = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">'
+            "<s:Body><u:GetHostListInfo "
+            'xmlns:u="urn:dslforum-org:service:Hosts:1"/></s:Body></s:Envelope>'
+        )
+        req = Request(
+            f"{host}/upnp/control/hosts",
+            data=soap.encode(),
+            headers={
+                "Content-Type": 'text/xml; charset="utf-8"',
+                "SOAPAction": '"urn:dslforum-org:service:Hosts:1#GetHostListInfo"',
+            },
+            method="POST",
+        )
+        with urlopen(req, timeout=8) as resp:
+            root = ET.fromstring(resp.read())
+        clients: list[RouterClient] = []
+        for elem in root.iter():
+            if elem.tag.split("}")[-1] != "NewHostList":
+                continue
+            for child in elem:
+                ip = mac = name = ""
+                for fld in child:
+                    ft = fld.tag.split("}")[-1]
+                    if ft == "NewIPAddress":
+                        ip = fld.text or ""
+                    elif ft == "NewMACAddress":
+                        mac = (fld.text or "").lower()
+                    elif ft == "NewHostName":
+                        name = fld.text or ""
+                if mac:
+                    clients.append(RouterClient(ip=ip, mac=mac, name=name or "?"))
+        clients.sort(key=lambda c: ipaddress.ip_address(c.ip) if c.ip.count(".") == 3 else c.ip)
+        return clients, f"Fritz!Box: {len(clients)} hosts"
+    except (URLError, ET.ParseError, TimeoutError) as exc:
+        return [], f"Fritz!Box error: {exc}"
+
+
+def custom_router_hosts(cfg: dict[str, Any]) -> tuple[list[RouterClient], str]:
+    script = expand_path(cfg["router"]["custom_script"])
+    if not script.is_file():
+        return [], f"missing script: {script}"
+    try:
+        proc = subprocess.run([str(script)], capture_output=True, text=True, timeout=15, check=False)
+        raw = (proc.stdout or "").strip()
+        items = json.loads(raw or "[]")
+        clients = [
+            RouterClient(
+                ip=str(item.get("ip", "?")),
+                mac=str(item.get("mac", "")).lower(),
+                name=str(item.get("name", "?")),
+            )
+            for item in items
+            if item.get("mac")
+        ]
+        clients.sort(key=lambda c: ipaddress.ip_address(c.ip) if c.ip.count(".") == 3 else c.ip)
+        return clients, f"custom script: {len(clients)} hosts"
+    except (json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+        return [], f"custom script error: {exc}"
+
+
+def router_clients(cfg: dict[str, Any]) -> tuple[list[RouterClient], str]:
+    if not cfg["router"].get("enabled"):
+        return [], "router.enabled: false"
+    rtype = (cfg["router"].get("type") or "disabled").lower()
+    if rtype == "disabled":
+        return [], "router.type: disabled"
+    if rtype == "fritzbox":
+        return fritzbox_hosts(cfg)
+    if rtype == "custom":
+        return custom_router_hosts(cfg)
+    return [], f"unknown router.type: {rtype}"
+
+
+def ss_established() -> list[str]:
+    cfg = load_config()
+    known = load_known(expand_path(cfg["alerts"]["state_file"]))
+    flows = outbound_flows(cfg, known, limit=10)
+    return [f.connection for f in flows] or ["(no established sessions)"]
+
+
+def _ss_process(line: str) -> str:
+    m = re.search(r'users:\(\("([^"]+)"', line)
+    if not m:
+        return ""
+    proc = m.group(1)
+    return "Cursor" if proc == "MainThread" else proc
+
+
+def _ss_process_pid(line: str) -> tuple[str, str]:
+    m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
+    if not m:
+        proc = _ss_process(line)
+        return proc, ""
+    proc = m.group(1)
+    proc = "Cursor" if proc == "MainThread" else proc
+    return proc, m.group(2)
+
+
+def _endpoint_host(addr: str) -> str:
+    if addr.count(":") >= 2 and "]" in addr:
+        m = re.match(r"^\[(.+)\](?::(\d+))?$", addr)
+        if m:
+            return m.group(1)
+    host = addr.rsplit(":", 1)[0]
+    if "%" in host:
+        host = host.split("%", 1)[0]
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    elif host.startswith("["):
+        host = host[1:]
+    return host
+
+
+def _normalize_ip(ip: str) -> str:
+    ip = ip.strip()
+    if ip.startswith("[") and ip.endswith("]"):
+        ip = ip[1:-1]
+    lower = ip.lower()
+    if lower.startswith("::ffff:"):
+        return ip[7:]
+    return ip
+
+
+def _is_loopback_ip(ip: str) -> bool:
+    if not ip or ip in ("*", "0.0.0.0"):
+        return False
+    ip = _normalize_ip(ip)
+    if ip in ("127.0.0.1", "::1"):
+        return True
+    if ip.startswith("127."):
+        return True
+    try:
+        return ipaddress.ip_address(ip).is_loopback
+    except ValueError:
+        return False
+
+
+def _endpoint_port(addr: str) -> str:
+    if addr.count(":") >= 2 and "[" in addr:
+        m = re.search(r"\]:([0-9]+)$", addr)
+        return m.group(1) if m else ""
+    return addr.rsplit(":", 1)[-1] if ":" in addr else ""
+
+
+def _compact_conn(local: str, remote: str, local_ip: str) -> str:
+    """Shorten same-subnet IP in connection strings (e.g. .21:port)."""
+    prefix = ""
+    if local_ip and local_ip.count(".") == 3:
+        prefix = local_ip.rsplit(".", 1)[0] + "."
+
+    def short(addr: str) -> str:
+        host = _endpoint_host(addr)
+        port = _endpoint_port(addr)
+        if prefix and host.startswith(prefix):
+            host = "." + host[len(prefix) :]
+        return f"{host}:{port}" if port else host
+
+    return f"{short(local)} → {short(remote)}"
+
+
+def _is_tailscale_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return addr in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        return False
+
+
+def _simplify_hostname(host: str) -> str:
+    host = host.strip().rstrip(".")
+    if not host:
+        return ""
+    lower = host.lower()
+    if "amazonaws.com" in lower:
+        return "AWS EC2"
+    if lower.endswith(".ts.net"):
+        return host.split(".")[0]
+    if lower.endswith(".local"):
+        return host.split(".")[0]
+    if lower.startswith("ec2-"):
+        return "AWS EC2"
+    return host[:22]
+
+
+def _reverse_dns(ip: str, cache: dict[str, str]) -> str:
+    if ip in cache:
+        return cache[ip]
+    name = ""
+    if shutil.which("getent"):
+        out = run(["getent", "hosts", ip], timeout=2)
+        if out:
+            name = _simplify_hostname(out.split()[1] if len(out.split()) > 1 else out)
+    if not name:
+        old = socket.getdefaulttimeout()
+        try:
+            socket.setdefaulttimeout(0.6)
+            host, _, _ = socket.gethostbyaddr(ip)
+            name = _simplify_hostname(host)
+        except OSError:
+            name = ""
+        finally:
+            socket.setdefaulttimeout(old)
+    cache[ip] = name
+    return name
+
+
+def _ip_name_lookup(
+    ip: str,
+    *,
+    known: dict[str, dict],
+    router_clients: list[RouterClient],
+    tailscale: list[TailscalePeer],
+    gateway: str,
+    dns_cache: dict[str, str],
+) -> str:
+    if ip == gateway:
+        return "ZTE router"
+    for _mac, entry in known.items():
+        if str(entry.get("last_ip") or "") == ip:
+            label = (entry.get("label") or entry.get("auto_guess") or entry.get("hostname") or "").strip()
+            if label:
+                return label.split(".")[0][:22]
+    for client in router_clients:
+        if client.ip == ip and client.name:
+            return client.name[:22]
+    for peer in tailscale:
+        if peer.ip == ip and peer.name:
+            return peer.name[:22]
+    if _is_tailscale_ip(ip):
+        rdns = _reverse_dns(ip, dns_cache)
+        if rdns:
+            return rdns
+        return "Tailscale peer"
+    if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+        if shutil.which("avahi-resolve"):
+            out = run(["avahi-resolve", "-a", ip], timeout=2)
+            if out and "\t" in out:
+                name = _simplify_hostname(out.split("\t", 1)[1])
+                if name:
+                    return name
+    rdns = _reverse_dns(ip, dns_cache)
+    return rdns or "(no reverse DNS)"
+
+
+def _outbound_notes(
+    *,
+    local: str,
+    remote_ip: str,
+    remote_port: str,
+    proc: str,
+    gateway: str,
+) -> str:
+    parts: list[str] = []
+    if proc:
+        parts.append(proc)
+    if _endpoint_port(local) == "68" and remote_port == "67":
+        return "DHCP renew"
+    if remote_ip == gateway:
+        parts.append("gateway")
+    if remote_port == "8009":
+        parts.append("TV Cast")
+    elif remote_port == "8001":
+        parts.append("Samsung API")
+    elif remote_port == "443":
+        parts.append("HTTPS")
+    elif remote_port == "8885":
+        parts.append("custom port")
+    if _is_tailscale_ip(_endpoint_host(local)) or _is_tailscale_ip(remote_ip):
+        parts.append("Tailscale mesh")
+    if remote_ip.startswith("192.168.") or remote_ip.startswith("10."):
+        parts.append("LAN")
+    if not parts:
+        return "active session"
+    return " · ".join(dict.fromkeys(parts))
+
+
+def outbound_flows(
+    cfg: dict[str, Any],
+    known: dict[str, dict],
+    router_clients: list[RouterClient] | None = None,
+    tailscale: list[TailscalePeer] | None = None,
+    *,
+    limit: int = 8,
+) -> list[OutboundFlow]:
+    router_clients = router_clients or []
+    tailscale = tailscale or []
+    _, gateway, local_ip = default_route()
+    dns_cache: dict[str, str] = {}
+    flows: list[OutboundFlow] = []
+    seen: set[str] = set()
+
+    raw = run(["ss", "-H", "-tunp", "state", "established"], timeout=5)
+    for line in raw.splitlines():
+        cols = line.split()
+        if len(cols) < 5:
+            continue
+        local, remote = cols[3], cols[4]
+        remote_ip = _endpoint_host(remote)
+        if remote_ip in ("127.0.0.1", "::1") or remote_ip.startswith("127."):
+            continue
+        proc = _ss_process(line)
+        remote_port = _endpoint_port(remote)
+        key = f"{remote_ip}:{remote_port}:{proc}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        name = _ip_name_lookup(
+            remote_ip,
+            known=known,
+            router_clients=router_clients,
+            tailscale=tailscale,
+            gateway=gateway,
+            dns_cache=dns_cache,
+        )
+        notes = _outbound_notes(
+            local=local,
+            remote_ip=remote_ip,
+            remote_port=remote_port,
+            proc=proc,
+            gateway=gateway,
+        )
+        flows.append(
+            OutboundFlow(
+                connection=_compact_conn(local, remote, local_ip),
+                name=name,
+                notes=notes,
+            )
+        )
+        if len(flows) >= limit:
+            break
+
+    return flows
+
+
+def format_outbound_lines(flows: list[OutboundFlow], width: int, limit: int = 8) -> list[str]:
+    flows = flows[:limit]
+    if not flows:
+        return ["(no established sessions)"]
+    if width < 36:
+        rows = ["◈ connection → name"]
+        for f in flows:
+            rows.append(f.connection[: width - 1])
+            rows.append(f"  {f.name[:16]}  {f.notes}"[: width - 1])
+        return rows
+
+    conn_w = min(26, max(14, width * 2 // 5))
+    name_w = min(16, max(8, width // 4))
+    note_w = max(6, width - conn_w - name_w - 2)
+    rows = [
+        f"{'CONNECTION':<{conn_w}} {'NAME':<{name_w}} NOTES"[: width - 1],
+        ("─" * min(width - 1, conn_w + name_w + 6))[: width - 1],
+    ]
+    for f in flows:
+        row = f"{f.connection[:conn_w]:<{conn_w}} {f.name[:name_w]:<{name_w}} {f.notes[:note_w]}"
+        rows.append(row[: width - 1])
+    return rows
+
+
+SERVICE_NAME_CACHE: dict[str, str] = {}
+
+
+def _service_name_from_port(port: str) -> str:
+    if port in SERVICE_NAME_CACHE:
+        return SERVICE_NAME_CACHE[port]
+    name = ""
+    if shutil.which("getent"):
+        out = run(["getent", "services", port], timeout=1)
+        if out:
+            name = out.split("/")[0].split()[0].strip()
+    SERVICE_NAME_CACHE[port] = name
+    return name
+
+
+def _service_label(port: str, proc: str) -> str:
+    if proc:
+        return proc[:12]
+    svc = _service_name_from_port(port)
+    if svc:
+        return svc[:12]
+    return f":{port}"
+
+
+@dataclass
+class ListenerMatch:
+    proc: str
+    pid: str
+    proto: str
+    source: str = "ss"
+
+
+_LISTENER_SCAN_CACHE: tuple[float, dict[str, ListenerMatch]] | None = None
+_LISTENER_SCAN_TTL = 2.0
+
+
+def _sudo_read_tools_available() -> bool:
+    if not shutil.which("sudo"):
+        return False
+    probe = run(["sudo", "-n", "ss", "-H", "-tln"], timeout=3)
+    return "password is required" not in probe.lower() and "a password is required" not in probe.lower()
+
+
+def _parse_lsof_listen(out: str, proto: str) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for line in out.splitlines():
+        if not line or line.startswith("COMMAND"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        proc, pid = parts[0], parts[1]
+        port_m = re.search(r":(\d+)(?:\s|\(|$)", line)
+        if not port_m:
+            continue
+        rows.append((port_m.group(1), proc, pid))
+    return rows
+
+
+def _parse_fuser_port(out: str, err: str, proto: str) -> list[tuple[str, str, str]]:
+    """Parse fuser output for a single port query."""
+    text = f"{out}\n{err}"
+    pids = re.findall(r"\b(\d+)\b", text)
+    rows: list[tuple[str, str, str]] = []
+    for pid in dict.fromkeys(pids):
+        cmdline = Path(f"/proc/{pid}/comm")
+        proc = cmdline.read_text().strip() if cmdline.is_file() else "?"
+        rows.append(("", proc, pid))
+    return rows
+
+
+def _scan_listener_processes(*, use_sudo: bool = True) -> dict[str, ListenerMatch]:
+    """Build port → process map from live OS data (no hardcoded port list)."""
+    global _LISTENER_SCAN_CACHE
+    now = time.time()
+    if _LISTENER_SCAN_CACHE and now - _LISTENER_SCAN_CACHE[0] < _LISTENER_SCAN_TTL:
+        return _LISTENER_SCAN_CACHE[1]
+
+    rank = {"sudo_ss": 50, "user_ss": 30, "sudo_lsof": 40, "user_lsof": 20, "sudo_fuser": 35}
+    matches: dict[str, ListenerMatch] = {}
+    match_rank: dict[str, int] = {}
+
+    def consider(port: str, proc: str, pid: str, proto: str, source: str) -> None:
+        if not port or not proc:
+            return
+        r = rank.get(source, 0)
+        if port not in matches or r > match_rank.get(port, 0):
+            matches[port] = ListenerMatch(proc=proc, pid=pid, proto=proto, source=source)
+            match_rank[port] = r
+
+    ss_cmds: list[tuple[list[str], str, str]] = []
+    if use_sudo and shutil.which("sudo"):
+        ss_cmds.extend(
+            [
+                (["sudo", "-n", "ss", "-H", "-tlnp"], "tcp", "sudo_ss"),
+                (["sudo", "-n", "ss", "-H", "-ulnp"], "udp", "sudo_ss"),
+            ]
+        )
+    ss_cmds.extend(
+        [
+            (["ss", "-H", "-tlnp"], "tcp", "user_ss"),
+            (["ss", "-H", "-ulnp"], "udp", "user_ss"),
+        ]
+    )
+    for cmd, proto, source in ss_cmds:
+        out = run(cmd, timeout=5)
+        if "password is required" in out.lower():
+            continue
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            port = _endpoint_port(cols[3])
+            proc, pid = _ss_process_pid(line)
+            consider(port, proc, pid, proto, source)
+
+    lsof = shutil.which("lsof")
+    if lsof:
+        lsof_cmds: list[tuple[list[str], str, str]] = []
+        if use_sudo and shutil.which("sudo"):
+            lsof_cmds.extend(
+                [
+                    (["sudo", "-n", lsof, "-iTCP", "-sTCP:LISTEN", "-P", "-n"], "tcp", "sudo_lsof"),
+                    (["sudo", "-n", lsof, "-iUDP", "-P", "-n"], "udp", "sudo_lsof"),
+                ]
+            )
+        lsof_cmds.extend(
+            [
+                ([lsof, "-iTCP", "-sTCP:LISTEN", "-P", "-n"], "tcp", "user_lsof"),
+                ([lsof, "-iUDP", "-P", "-n"], "udp", "user_lsof"),
+            ]
+        )
+        for cmd, proto, source in lsof_cmds:
+            out = run(cmd, timeout=8)
+            if "password is required" in out.lower():
+                continue
+            for port, proc, pid in _parse_lsof_listen(out, proto):
+                consider(port, proc, pid, proto, source)
+
+    _LISTENER_SCAN_CACHE = (now, matches)
+    return matches
+
+
+def _resolve_listener(port: str, listener_map: dict[str, ListenerMatch] | None = None) -> tuple[str, str, str, str]:
+    """Return (process, pid, proto, detail). Fully dynamic — no port name database."""
+    listener_map = listener_map or _scan_listener_processes()
+    hit = listener_map.get(port)
+    if hit:
+        return hit.proc, hit.pid, hit.proto, ""
+
+    # Last resort for a single unknown port: fuser (still dynamic)
+    if shutil.which("fuser"):
+        for proto in ("tcp", "udp"):
+            for cmd_prefix in (["sudo", "-n", "fuser"], ["fuser"]):
+                if cmd_prefix[0] == "sudo" and not shutil.which("sudo"):
+                    continue
+                cmd = [*cmd_prefix, f"{port}/{proto}"]
+                try:
+                    proc = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=4, check=False
+                    )
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    continue
+                err = (proc.stderr or proc.stdout or "").strip()
+                if "password is required" in err.lower() or not err:
+                    continue
+                pid_m = re.search(r"\b(\d+)\b", err)
+                if pid_m:
+                    pid = pid_m.group(1)
+                    comm = Path(f"/proc/{pid}/comm")
+                    name = comm.read_text().strip() if comm.is_file() else "?"
+                    return name, pid, proto, ""
+    return "", "", "", ""
+
+
+def dig_listener(port: str, listener_map: dict[str, ListenerMatch] | None = None) -> dict[str, Any]:
+    """Deep lookup for one port — used by CLI and detail view."""
+    proc, pid, proto, detail = _resolve_listener(port, listener_map)
+    lines: list[str] = []
+    for cmd in (
+        ["ss", "-H", "-tlnp", f"sport = :{port}"],
+        ["ss", "-H", "-ulnp", f"sport = :{port}"],
+        ["sudo", "-n", "ss", "-H", "-tulnp", f"sport = :{port}"],
+    ):
+        if cmd[0] == "sudo" and not shutil.which("sudo"):
+            continue
+        out = run(cmd, timeout=5)
+        if out and "password is required" not in out.lower():
+            lines.extend(out.splitlines())
+    sudo_ok = _sudo_read_tools_available()
+    unresolved = not proc and not detail
+    return {
+        "port": port,
+        "process": proc or detail or ("unidentified" if unresolved else "?"),
+        "pid": pid,
+        "proto": proto,
+        "detail": detail,
+        "ss_lines": lines,
+        "sudo_ok": sudo_ok,
+        "tip": (
+            "Run: netwatch --setup  (enables passwordless sudo ss/lsof for root-owned services)"
+            if unresolved and not sudo_ok
+            else ""
+        ),
+    }
+
+
+def _ephemeral_port_range() -> tuple[int, int]:
+    path = Path("/proc/sys/net/ipv4/ip_local_port_range")
+    try:
+        parts = path.read_text().split()
+        if len(parts) >= 2:
+            return int(parts[0]), int(parts[1])
+    except OSError:
+        pass
+    return 32768, 60999
+
+
+def _listening_sockets() -> dict[str, list[str]]:
+    ports: dict[str, list[str]] = {}
+    for flag in ("-tln", "-uln"):
+        for line in run(["ss", "-H", flag], timeout=5).splitlines():
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            host = _endpoint_host(cols[3])
+            port = _endpoint_port(cols[3])
+            if not port:
+                continue
+            ports.setdefault(port, [])
+            if host not in ports[port]:
+                ports[port].append(host)
+    return ports
+
+
+def trusted_peers_path(cfg: dict[str, Any]) -> Path:
+    return expand_path(
+        cfg.get("host_exposure", {}).get("trusted_peers_file", str(TRUSTED_PEERS_PATH))
+    )
+
+
+def load_trusted_peers(cfg: dict[str, Any]) -> dict[str, dict]:
+    path = trusted_peers_path(cfg)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_trusted_peers(cfg: dict[str, Any], peers: dict[str, dict]) -> None:
+    path = trusted_peers_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(peers, indent=2, sort_keys=True) + "\n")
+
+
+def is_trusted_inbound_ip(cfg: dict[str, Any], ip: str, peers: dict[str, dict] | None = None) -> bool:
+    if ip in (cfg.get("host_exposure", {}).get("trusted_ips") or []):
+        return True
+    peers = peers if peers is not None else load_trusted_peers(cfg)
+    return ip in peers
+
+
+def trust_inbound_ips(cfg: dict[str, Any], ips: list[str]) -> int:
+    peers = load_trusted_peers(cfg)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    count = 0
+    for ip in ips:
+        ip = ip.strip()
+        if not ip or is_trusted_inbound_ip(cfg, ip, peers):
+            continue
+        entry = peers.get(ip, {})
+        if not isinstance(entry, dict):
+            entry = {"label": str(entry)}
+        entry["ack_at"] = now
+        peers[ip] = entry
+        count += 1
+    if count:
+        save_trusted_peers(cfg, peers)
+    return count
+
+
+def inbound_flows(
+    cfg: dict[str, Any],
+    known: dict[str, dict],
+    router_clients: list[RouterClient] | None = None,
+    tailscale: list[TailscalePeer] | None = None,
+    *,
+    limit: int = 8,
+) -> tuple[list[InboundFlow], list[str]]:
+    he = cfg.get("host_exposure", {})
+    if not he.get("enabled", True) or not he.get("monitor_inbound", True):
+        return [], []
+
+    router_clients = router_clients or []
+    tailscale = tailscale or []
+    listen = _listening_sockets()
+    eph_lo, eph_hi = _ephemeral_port_range()
+    trusted = load_trusted_peers(cfg)
+    _, gateway, local_ip = default_route()
+    dns_cache: dict[str, str] = {}
+    flows: list[InboundFlow] = []
+    new_ips: list[str] = []
+    seen: set[str] = set()
+
+    for line in run(["ss", "-H", "-tunp", "state", "established"], timeout=5).splitlines():
+        cols = line.split()
+        if len(cols) < 5:
+            continue
+        local, remote = cols[3], cols[4]
+        local_ip_ep, local_port = _endpoint_host(local), _endpoint_port(local)
+        remote_ip, remote_port = _endpoint_host(remote), _endpoint_port(remote)
+        if _is_loopback_ip(remote_ip) or _is_loopback_ip(local_ip_ep):
+            continue
+        if local_ip and _normalize_ip(remote_ip) == _normalize_ip(local_ip):
+            continue
+        if not local_port or local_port not in listen:
+            continue
+        bind_addrs = listen.get(local_port, [])
+        if bind_addrs and all(_is_loopback_ip(a) or a in ("127.0.0.1", "[::1]") for a in bind_addrs):
+            continue
+        try:
+            rp = int(remote_port)
+        except ValueError:
+            continue
+        if not (eph_lo <= rp <= eph_hi):
+            continue
+
+        proc = _ss_process(line)
+        key = f"{remote_ip}:{local_port}:{proc}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        name = _ip_name_lookup(
+            remote_ip,
+            known=known,
+            router_clients=router_clients,
+            tailscale=tailscale,
+            gateway=gateway,
+            dns_cache=dns_cache,
+        )
+        service = _service_label(local_port, proc)
+        is_new = not is_trusted_inbound_ip(cfg, remote_ip, trusted)
+        if is_new and remote_ip not in new_ips:
+            new_ips.append(remote_ip)
+
+        flows.append(
+            InboundFlow(
+                connection=_compact_conn(remote, local, local_ip),
+                remote_ip=remote_ip,
+                name=name,
+                service=service,
+                proc=proc,
+                is_new=is_new,
+            )
+        )
+        if len(flows) >= limit:
+            break
+
+    return flows, new_ips
+
+
+def format_inbound_lines(flows: list[InboundFlow], width: int, limit: int = 6) -> list[str]:
+    flows = flows[:limit]
+    if not flows:
+        return ["(no inbound sessions)"]
+    if width < 34:
+        rows: list[str] = []
+        for f in flows:
+            tag = "▸NEW" if f.is_new else ""
+            rows.append(f"{f.remote_ip[:14]} → :{f.service}{tag}"[: width - 1])
+        return rows
+
+    peer_w = min(18, max(10, width // 3))
+    svc_w = min(10, max(6, width // 5))
+    rows = [f"{'REMOTE':<{peer_w}} {'SVC':<{svc_w}} PROC"[: width - 1]]
+    for f in flows:
+        tag = "*" if f.is_new else " "
+        row = f"{tag}{f.name[:peer_w - 1]:<{peer_w - 1}} {f.service[:svc_w]:<{svc_w}} {f.proc[: max(4, width - peer_w - svc_w - 2)]}"
+        rows.append(row[: width - 1])
+    return rows
+
+
+def network_path_links(cfg: dict[str, Any]) -> list[BridgeLink]:
+    he = cfg.get("host_exposure", {})
+    if not he.get("enabled", True) or not he.get("monitor_bridges", True):
+        return []
+
+    links: list[BridgeLink] = []
+    seen: set[str] = set()
+
+    def add(name: str, state: str, note: str) -> None:
+        if name in seen:
+            return
+        seen.add(name)
+        links.append(BridgeLink(name=name, state=state, note=note))
+
+    for line in run(["ip", "-br", "link", "show", "type", "bridge"]).splitlines():
+        parts = line.split(maxsplit=3)
+        if parts:
+            add(parts[0], parts[1] if len(parts) > 1 else "?", "L2 bridge — LAN segments meet here")
+
+    for itype, note in (
+        ("tun", "VPN tunnel — remote peers may reach this host"),
+        ("wireguard", "WireGuard — mesh / remote access path"),
+    ):
+        for line in run(["ip", "-br", "link", "show", "type", itype]).splitlines():
+            parts = line.split(maxsplit=3)
+            if parts:
+                add(parts[0], parts[1] if len(parts) > 1 else "?", note)
+
+    for line in run(["ip", "-br", "link"]).splitlines():
+        parts = line.split(maxsplit=3)
+        if not parts:
+            continue
+        name = parts[0].split("@", 1)[0]
+        state = parts[1] if len(parts) > 1 else "?"
+        if name in seen:
+            continue
+        if name in ("docker0", "virbr0", "tailscale0", "cni0") or name.startswith(("br-", "veth")):
+            note = "virtual path — other devices can route through this box"
+            if name == "tailscale0":
+                note = "Tailscale mesh — trusted peers can reach services"
+            elif name == "docker0":
+                note = "Docker bridge — container network gateway"
+            add(name, state, note)
+
+    return links[:8]
+
+
+def exposed_listeners(
+    cfg: dict[str, Any],
+    *,
+    limit: int = 6,
+    listener_map: dict[str, ListenerMatch] | None = None,
+) -> list[ExposedListener]:
+    he = cfg.get("host_exposure", {})
+    if not he.get("enabled", True) or not he.get("monitor_listeners", True):
+        return []
+
+    _, _, local_ip = default_route()
+    trusted_ports = {str(p) for p in (he.get("trusted_ports") or [])}
+    rows: list[ExposedListener] = []
+    seen: set[str] = set()
+    listener_map = listener_map or _scan_listener_processes(
+        use_sudo=he.get("resolve_with_sudo", True)
+    )
+
+    for flag in ("-tln", "-uln"):
+        for line in run(["ss", "-H", flag]).splitlines():
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            bind = cols[3]
+            host = _endpoint_host(bind)
+            port = _endpoint_port(bind)
+            if not port or port in seen:
+                continue
+            if _is_loopback_ip(host):
+                continue
+            if host not in ("0.0.0.0", "*", "[::]", "::", local_ip) and not host.startswith("192.168."):
+                if not host.startswith("10.") and not host.startswith("172."):
+                    continue
+            seen.add(port)
+            proc, pid, proto, detail = _resolve_listener(port, listener_map)
+            if not proc and not detail:
+                detail = "unidentified"
+            if port in trusted_ports:
+                risk = "ok"
+            elif host in ("0.0.0.0", "*", "[::]", "::"):
+                risk = "alert"
+            else:
+                risk = "warn"
+            rows.append(
+                ExposedListener(
+                    bind=bind[:22],
+                    port=port,
+                    proc=proc,
+                    risk=risk,
+                    pid=pid,
+                    proto=proto,
+                    detail=detail,
+                )
+            )
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+def active_login_sessions() -> list[str]:
+    rows: list[str] = []
+    for line in run(["who"]).splitlines():
+        line = line.strip()
+        if line:
+            rows.append(line[:72])
+    if not rows and shutil.which("users"):
+        out = run(["users"]).strip()
+        if out:
+            rows.append(f"users: {out[:64]}")
+    return rows[:5]
+
+
+def collect_host_exposure(
+    cfg: dict[str, Any],
+    known: dict[str, dict],
+    router_clients: list[RouterClient],
+    tailscale: list[TailscalePeer],
+) -> tuple[list[InboundFlow], list[str], list[BridgeLink], list[ExposedListener], list[str]]:
+    he = cfg.get("host_exposure", {})
+    listener_map = _scan_listener_processes(use_sudo=he.get("resolve_with_sudo", True))
+    inbound, new_inbound = inbound_flows(
+        cfg, known, router_clients, tailscale, limit=12
+    )
+    bridges = network_path_links(cfg)
+    exposed = exposed_listeners(cfg, limit=8, listener_map=listener_map)
+    logins = active_login_sessions()
+    return inbound, new_inbound, bridges, exposed, logins
+
+
+def listener_resolve_status(cfg: dict[str, Any]) -> str:
+    """Short status when root-owned listeners cannot be named yet."""
+    if not _sudo_read_tools_available():
+        he = cfg.get("host_exposure", {})
+        listener_map = _scan_listener_processes(use_sudo=False)
+        exposed = exposed_listeners(cfg, limit=16, listener_map=listener_map)
+        if any(format_listener_label(e) == "unidentified" for e in exposed):
+            return "run netwatch --setup once for full process names"
+    return ""
+
+
+def ss_listening() -> list[str]:
+    rows: list[str] = []
+    for line in run(["ss", "-H", "-tln"]).splitlines()[:10]:
+        cols = line.split()
+        if len(cols) >= 4:
+            rows.append(cols[3])
+    return rows or ["(nothing listening on TCP)"]
+
+
+def firewall_state() -> str:
+    if not shutil.which("firewall-cmd"):
+        return "firewalld not installed"
+    state = run(["firewall-cmd", "--state"])
+    if "running" not in state.lower():
+        return state or "unknown"
+    zone = run(["firewall-cmd", "--get-default-zone"])
+    return f"running, zone {zone or '?'}"
+
+
+def failed_logins() -> list[str]:
+    out = run(
+        ["journalctl", "_SYSTEMD_UNIT=sshd.service", "PRIORITY=err", "-n", "5", "--no-pager", "-o", "short-iso"],
+        timeout=5,
+    )
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    return lines[-5:] if lines else ["(no recent sshd errors)"]
+
+
+def load_secrets() -> dict[str, str]:
+    secrets: dict[str, str] = {}
+    if SECRETS_PATH.is_file():
+        for line in SECRETS_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            secrets[key.strip()] = val.strip()
+    for key in ("ROUTER_USER", "ROUTER_PASSWORD", "NETWATCH_SMTP_USER", "NETWATCH_SMTP_PASS"):
+        if key not in secrets and os.environ.get(key):
+            secrets[key] = os.environ[key]
+    return secrets
+
+
+def save_secrets(secrets: dict[str, str]) -> None:
+    SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Netwatch secrets — chmod 600, never commit", ""]
+    for key in (
+        "ROUTER_USER",
+        "ROUTER_PASSWORD",
+        "NETWATCH_SMTP_USER",
+        "NETWATCH_SMTP_PASS",
+    ):
+        val = (secrets.get(key) or "").strip()
+        if val:
+            lines.append(f"{key}={val}")
+    SECRETS_PATH.write_text("\n".join(lines) + "\n")
+    os.chmod(SECRETS_PATH, 0o600)
+
+
+def prompt_yes_no(prompt: str, *, default: bool = False) -> bool:
+    hint = "Y/n" if default else "y/N"
+    ans = input(f"{prompt} [{hint}]: ").strip().lower()
+    if not ans:
+        return default
+    return ans in ("y", "yes")
+
+
+def configure_credentials(*, force_router: bool = False) -> int:
+    """Interactive router (and optional SMTP) credential setup."""
+    secrets = load_secrets()
+    print("Netwatch // credential setup")
+    print(f"File: {SECRETS_PATH} (mode 600, never commit to git)\n")
+
+    has_router = bool(secrets.get("ROUTER_PASSWORD"))
+    if has_router and not force_router:
+        if not prompt_yes_no("Update router username/password?", default=False):
+            skip_router = True
+        else:
+            skip_router = False
+    else:
+        skip_router = False
+        if not has_router:
+            print("→ Router login enables whole-house Wi‑Fi deny on supported gateways (e.g. ZTE).")
+            print("  Skip if you only need PC-side quarantine.\n")
+
+    if not skip_router:
+        user = input("Router username [admin]: ").strip() or "admin"
+        while True:
+            password = getpass.getpass("Router password (empty to skip): ")
+            if not password:
+                if has_router and not force_router:
+                    print("Keeping existing router password.")
+                elif prompt_yes_no("Continue without router credentials?", default=True):
+                    secrets.pop("ROUTER_USER", None)
+                    secrets.pop("ROUTER_PASSWORD", None)
+                else:
+                    continue
+                break
+            confirm = getpass.getpass("Confirm router password: ")
+            if password != confirm:
+                print("Passwords do not match — try again.\n")
+                continue
+            secrets["ROUTER_USER"] = user
+            secrets["ROUTER_PASSWORD"] = password
+            break
+
+    if prompt_yes_no("Configure email alert credentials (SMTP)?", default=False):
+        smtp_user = input("SMTP username: ").strip()
+        smtp_pass = getpass.getpass("SMTP password or app token: ")
+        if smtp_user:
+            secrets["NETWATCH_SMTP_USER"] = smtp_user
+        if smtp_pass:
+            secrets["NETWATCH_SMTP_PASS"] = smtp_pass
+
+    save_secrets(secrets)
+    if secrets.get("ROUTER_PASSWORD"):
+        print(f"\n✓ Router credentials saved for user '{secrets.get('ROUTER_USER', 'admin')}'.")
+    else:
+        print("\n✓ Saved (no router password — PC-only block until you run --configure again).")
+    print(f"  {SECRETS_PATH}")
+    return 0
+
+
+def cli_configure() -> int:
+    return configure_credentials()
+
+
+def sudoers_content(user: str) -> str:
+    nft = shutil.which("nft") or "/usr/sbin/nft"
+    fw = shutil.which("firewall-cmd") or "/usr/bin/firewall-cmd"
+    ss_bin = shutil.which("ss") or "/usr/sbin/ss"
+    lsof_bin = shutil.which("lsof") or "/usr/bin/lsof"
+    fuser_bin = shutil.which("fuser") or "/usr/sbin/fuser"
+    return (
+        f"# Installed by netwatch --setup\n"
+        f"{user} ALL=(root) NOPASSWD: {nft}\n"
+        f"{user} ALL=(root) NOPASSWD: {fw}\n"
+        f"{user} ALL=(root) NOPASSWD: {ss_bin}\n"
+        f"{user} ALL=(root) NOPASSWD: {lsof_bin}\n"
+        f"{user} ALL=(root) NOPASSWD: {fuser_bin}\n"
+    )
+
+
+def install_enforcement_privileges(user: str | None = None) -> tuple[bool, str]:
+    user = user or os.environ.get("USER") or "root"
+    content = sudoers_content(user)
+    path = f"/etc/sudoers.d/netwatch-{user}"
+    tmp = CONFIG_DIR / ".sudoers.tmp"
+    tmp.write_text(content)
+    try:
+        proc = subprocess.run(
+            ["pkexec", "bash", "-c", f"install -m 440 {tmp} {path} && visudo -cf {path}"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "pkexec failed").strip()
+            return False, err[:200]
+        SETUP_MARKER.write_text(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
+        return True, f"installed {path}"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, str(exc)[:200]
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def install_systemd_restore() -> tuple[bool, str]:
+    unit = (
+        "[Unit]\n"
+        "Description=Restore netwatch quarantine rules after login\n"
+        "After=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={Path.home() / '.local/bin/netwatch'} --restore-blocks\n"
+        "RemainAfterExit=yes\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    SYSTEMD_USER_UNIT.parent.mkdir(parents=True, exist_ok=True)
+    SYSTEMD_USER_UNIT.write_text(unit)
+    try:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, timeout=10)
+        subprocess.run(["systemctl", "--user", "enable", "netwatch-blocks.service"], check=False, timeout=10)
+        return True, "systemd user restore enabled"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, str(exc)[:200]
+
+
+def ensure_enforcement_ready(cfg: dict[str, Any], *, interactive: bool = False) -> tuple[bool, str]:
+    del interactive  # setup only via netwatch --setup or explicit TUI consent
+    cm = cfg.get("countermeasures", {})
+    if not cm.get("enabled", True):
+        return True, "countermeasures disabled"
+
+    if SETUP_MARKER.is_file():
+        return True, "enforcement ready"
+
+    return False, "run: netwatch --setup"
+
+
+def cli_setup(cfg: dict[str, Any] | None = None) -> int:
+    cfg = cfg or load_config()
+    print(f"Netwatch enforcement setup (v{__version__})")
+    print("Step 1/2 — credentials")
+    if not load_secrets().get("ROUTER_PASSWORD"):
+        configure_credentials(force_router=False)
+    elif prompt_yes_no("\nRe-run credential setup before sudo install?", default=False):
+        configure_credentials(force_router=False)
+    print("\nStep 2/2 — system privileges (one GUI password prompt)")
+    print("→ Installing passwordless nft/firewalld/ss/lsof access…")
+    ok, msg = install_enforcement_privileges()
+    print(msg)
+    if not ok:
+        return 1
+
+    ok2, msg2 = True, "restore on boot disabled (manual quarantine only)"
+    if cfg.get("countermeasures", {}).get("restore_on_boot"):
+        ok2, msg2 = install_systemd_restore()
+    else:
+        SYSTEMD_USER_UNIT.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "disable", "netwatch-blocks.service"], check=False)
+    print(msg2)
+    print("Done. Press B on dashboard to quarantine unknown devices.")
+    return 0
+
+
+@dataclass
+class CapabilityGap:
+    prompt_id: str
+    title: str
+    body: list[str]
+    packages: list[str] = field(default_factory=list)
+    setup: bool = False
+    dismiss_proceeds: bool = True
+
+
+def prompt_dismissed(cfg: dict[str, Any], prompt_id: str) -> bool:
+    dismissed = (cfg.get("prompts") or {}).get("dismissed") or {}
+    return bool(dismissed.get(prompt_id))
+
+
+def dismiss_prompt(cfg: dict[str, Any], prompt_id: str) -> None:
+    cfg.setdefault("prompts", {}).setdefault("dismissed", {})[prompt_id] = True
+    save_config(cfg)
+
+
+def install_os_packages(packages: list[str]) -> tuple[bool, str]:
+    pkgs = [p for p in packages if p]
+    if not pkgs:
+        return True, "nothing to install"
+    if not shutil.which("dnf"):
+        return False, "install manually: sudo dnf install " + " ".join(pkgs)
+    if not shutil.which("pkexec"):
+        return False, "install manually: sudo dnf install " + " ".join(pkgs)
+    try:
+        proc = subprocess.run(
+            ["pkexec", "dnf", "install", "-y", *pkgs],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, str(exc)[:180]
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "dnf install failed").strip()
+        return False, err[:200]
+    return True, f"installed {' '.join(pkgs)}"
+
+
+def run_tui_setup(cfg: dict[str, Any]) -> tuple[bool, str]:
+    ok, msg = install_enforcement_privileges()
+    if not ok:
+        return ok, msg
+    if cfg.get("countermeasures", {}).get("restore_on_boot"):
+        ok2, msg2 = install_systemd_restore()
+        if not ok2:
+            return ok, f"{msg}; restore: {msg2}"
+    return True, msg
+
+
+def check_house_scan_gap(cfg: dict[str, Any]) -> CapabilityGap | None:
+    if prompt_dismissed(cfg, "house_scan_tools"):
+        return None
+    packages: list[str] = []
+    lines = [
+        "Ping sweep always works. These packages unlock the full house scan:",
+    ]
+    methods = [str(m).lower() for m in (cfg.get("scan", {}).get("methods") or ["ping", "mdns"])]
+    if "mdns" in methods and not shutil.which("avahi-browse"):
+        packages.append("avahi-tools")
+        lines.append("▸ avahi-tools — mDNS discovery (phones, TVs, IoT)")
+    if cfg.get("scan", {}).get("use_nmap_if_available", True) and not shutil.which("nmap"):
+        if "nmap" not in packages:
+            packages.append("nmap")
+        lines.append("▸ nmap — faster /24 sweep (optional)")
+    if not packages:
+        return None
+    return CapabilityGap("house_scan_tools", "UPLINK DEGRADED // SCAN PACKAGES", lines, packages)
+
+
+def check_identify_gap(cfg: dict[str, Any]) -> CapabilityGap | None:
+    if prompt_dismissed(cfg, "identify_tools"):
+        return None
+    if not cfg.get("identify", {}).get("auto_enrich", True):
+        return None
+    if shutil.which("avahi-resolve"):
+        return None
+    return CapabilityGap(
+        "identify_tools",
+        "IDENTIFY // RESOLVE BLIND",
+        [
+            "ARP + vendor DB still work, but mDNS names need avahi-resolve.",
+            "▸ avahi-tools — hostname resolve for probes",
+        ],
+        ["avahi-tools"],
+    )
+
+
+def check_countermeasures_gap(cfg: dict[str, Any]) -> CapabilityGap | None:
+    if prompt_dismissed(cfg, "countermeasures_setup"):
+        return None
+    if not cfg.get("countermeasures", {}).get("enabled", True):
+        return None
+    if SETUP_MARKER.is_file():
+        return None
+    return CapabilityGap(
+        "countermeasures_setup",
+        "QUARANTINE LOCKED // SETUP REQUIRED",
+        [
+            "Blocking uses nftables/firewalld (+ router deny when configured).",
+            "Nothing is installed until you authorize setup once.",
+            "Terminal: netwatch --setup",
+            "Or press Y here (one GUI password prompt).",
+        ],
+        setup=True,
+        dismiss_proceeds=False,
+    )
+
+
+def check_host_exposure_gap(cfg: dict[str, Any]) -> CapabilityGap | None:
+    if prompt_dismissed(cfg, "host_exposure_sudo"):
+        return None
+    he = cfg.get("host_exposure", {})
+    if not he.get("enabled", True) or not he.get("resolve_with_sudo", True):
+        return None
+    if _sudo_read_tools_available():
+        return None
+    return CapabilityGap(
+        "host_exposure_sudo",
+        "HOST EXPOSURE // ROOT BLIND SPOT",
+        [
+            "System services need passwordless sudo ss/lsof to show process names.",
+            "Without setup, listeners may show as unidentified.",
+            "Terminal: netwatch --setup · or press Y here.",
+        ],
+        setup=True,
+    )
+
+
+def show_capability_prompt(stdscr, gap: CapabilityGap) -> str:
+    """Return yes | no | dismiss."""
+    stdscr.timeout(-1)
+    try:
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            box_w = min(max(44, w - 4), 72)
+            box_h = min(max(12, len(gap.body) + 10), h - 4)
+            box_y = max(1, (h - box_h) // 2)
+            box_x = max(0, (w - box_w) // 2)
+            draw_cyber_panel(stdscr, box_y, box_x, box_h, box_w, gap.title, pair=CP_ALERT)
+            y = box_y + 1
+            for line in gap.body[: box_h - 8]:
+                safe_addstr(stdscr, y, box_x + 2, line[: box_w - 4], cp(CP_YELLOW, dim=True))
+                y += 1
+            y = box_y + box_h - 5
+            if gap.setup:
+                dismiss_opt = (
+                    " D  open anyway · don't ask again "
+                    if gap.dismiss_proceeds
+                    else " D  don't ask again (still needs setup) "
+                )
+                opts = [
+                    " Y  authorize netwatch --setup & continue ",
+                    " N  cancel ",
+                    dismiss_opt,
+                ]
+            else:
+                opts = [
+                    " Y  install packages & continue ",
+                    " N  cancel ",
+                    " D  continue without · don't ask again ",
+                ]
+            for opt in opts:
+                safe_addstr(stdscr, y, box_x + 2, opt[: box_w - 4], cp(CP_CYAN, bold=True))
+                y += 1
+            safe_addstr(
+                stdscr,
+                h - 2,
+                2,
+                "▸ neural consent gate — Esc cancels"[: w - 4],
+                cp(CP_MAGENTA, dim=True),
+            )
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch in (ord("y"), ord("Y")):
+                return "yes"
+            if ch in (ord("n"), ord("N"), 27):
+                return "no"
+            if ch in (ord("d"), ord("D")):
+                return "dismiss"
+    finally:
+        stdscr.timeout(IDLE_TIMEOUT_MS)
+
+
+def gate_capability(stdscr, cfg: dict[str, Any], gap: CapabilityGap | None) -> tuple[bool, str]:
+    """Return (proceed, status_message). status_message set when blocked or after install."""
+    if not gap:
+        return True, ""
+    choice = show_capability_prompt(stdscr, gap)
+    if choice == "no":
+        return False, "cancelled"
+    if choice == "dismiss":
+        dismiss_prompt(cfg, gap.prompt_id)
+        if not gap.dismiss_proceeds:
+            return False, "needs netwatch --setup (prompt dismissed)"
+        return True, ""
+    if gap.setup:
+        ok, msg = run_tui_setup(cfg)
+    else:
+        ok, msg = install_os_packages(list(dict.fromkeys(gap.packages)))
+    if not ok:
+        return False, msg
+    return True, msg
+
+
+class ZTERouterBlocker:
+    """ZTE F6600P/F8648P-style web API — MAC deny on the gateway."""
+
+    def __init__(self, host: str, username: str, password: str, timeout: int = 12):
+        host = host.rstrip("/")
+        if host.startswith("http"):
+            self.base_url = host
+        else:
+            self.base_url = f"http://{host}"
+        self.username = username
+        self.password = password
+        self.timeout = timeout
+        self.session_token = ""
+        self.logged_in = False
+        self.cookie_jar = CookieJar()
+        self.opener = build_opener(HTTPCookieProcessor(self.cookie_jar))
+
+    def _request(self, path: str, method: str = "GET", data: dict | None = None) -> str:
+        url = f"{self.base_url}{path}"
+        if data and method == "POST":
+            body = urlencode(data).encode()
+            req = Request(url, data=body, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        else:
+            req = Request(url, method=method)
+        req.add_header("Referer", self.base_url)
+        req.add_header("User-Agent", "netwatch/2.0")
+        with self.opener.open(req, timeout=self.timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    def login(self) -> None:
+        raw = self._request("/?_type=loginData&_tag=login_entry")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("router login page parse failed") from exc
+        self.session_token = str(data.get("sess_token") or "")
+        if int(data.get("lockingTime") or 0) > 0:
+            raise RuntimeError(f"router login locked ({data['lockingTime']}s)")
+
+        token_xml = self._request("/?_type=loginData&_tag=login_token")
+        try:
+            login_token = (ET.fromstring(token_xml).text or "").strip()
+        except ET.ParseError:
+            m = re.search(r">([^<]+)<", token_xml)
+            login_token = m.group(1).strip() if m else ""
+        if not login_token:
+            raise RuntimeError("router login token missing")
+
+        pwd_hash = hashlib.sha256((self.password + login_token).encode()).hexdigest()
+        result_raw = self._request(
+            "/?_type=loginData&_tag=login_entry",
+            "POST",
+            {
+                "action": "login",
+                "Username": self.username,
+                "Password": pwd_hash,
+                "_sessionTOKEN": self.session_token,
+            },
+        )
+        result = json.loads(result_raw)
+        self.session_token = str(result.get("sess_token") or self.session_token)
+        if not result.get("login_need_refresh"):
+            raise RuntimeError(str(result.get("loginErrMsg") or "router login failed"))
+        self.logged_in = True
+
+    def _load_view(self, view: str) -> None:
+        ts = int(time.time() * 1000)
+        resp = self._request(f"/?_type=menuView&_tag={view}&Menu3Location=0&_={ts}")
+        if "SessionTimeout" in resp:
+            self.logged_in = False
+            self.login()
+            self._load_view(view)
+
+    def block_mac(self, mac: str, cfg: dict[str, Any]) -> tuple[bool, str]:
+        rb = cfg.get("countermeasures", {}).get("router_block", {})
+        view = str(rb.get("mac_filter_view") or "wlanMacFilter")
+        data_tag = str(rb.get("mac_filter_data") or "wlan_macfilter_lua.lua")
+        mac_fmt = mac.upper().replace("-", ":")
+        self._load_view(view)
+        ts = int(time.time() * 1000)
+
+        # Try standard ZTE POST shape (deny list entry).
+        post_variants = [
+            {
+                "IF_ACTION": "Apply",
+                "Enable": "1",
+                "Policy": "0",
+                "MACAddress": mac_fmt,
+                "Name": f"netwatch-{mac_fmt[-8:]}",
+                "_sessionTOKEN": self.session_token,
+            },
+            {
+                "IF_ACTION": "Add",
+                "Enable": "1",
+                "FilterPolicy": "0",
+                "MACAddr": mac_fmt,
+                "_sessionTOKEN": self.session_token,
+            },
+        ]
+        for payload in post_variants:
+            try:
+                resp = self._request(f"/?_type=menuData&_tag={data_tag}&_={ts}", "POST", payload)
+                if "SessionTimeout" in resp:
+                    continue
+                if "IF_ERRORSTR" in resp and "SUCC" not in resp and "success" not in resp.lower():
+                    if "error" in resp.lower() or "fail" in resp.lower():
+                        continue
+                return True, f"router MAC deny {mac_fmt}"
+            except (RuntimeError, OSError, json.JSONDecodeError):
+                continue
+        return False, "router MAC filter API unavailable (PC quarantine still active)"
+
+
+def router_block_mac(cfg: dict[str, Any], mac: str, ip: str, action: str) -> tuple[bool, str]:
+    rb = cfg.get("countermeasures", {}).get("router_block", {})
+    if action != "block" or not rb.get("enabled", True):
+        return True, "router skip"
+    secrets = load_secrets()
+    user = secrets.get(str(rb.get("username_env") or "ROUTER_USER"), "admin")
+    password = secrets.get(str(rb.get("password_env") or "ROUTER_PASSWORD"), "")
+    if not password:
+        return False, "router password not configured — run: netwatch --setup"
+    host = router_admin_url(cfg)
+    if not host:
+        return False, "router host unknown — set router.url or check default route"
+    try:
+        client = ZTERouterBlocker(host, user, password)
+        client.login()
+        if action == "block":
+            return client.block_mac(mac, cfg)
+        return True, "router unblock logged"
+    except (RuntimeError, OSError, URLError, json.JSONDecodeError) as exc:
+        return False, str(exc)[:200]
+
+
+def blocked_path(cfg: dict[str, Any]) -> Path:
+    return expand_path(cfg.get("countermeasures", {}).get("block_file", str(BLOCKED_PATH)))
+
+
+def load_blocked(cfg: dict[str, Any]) -> dict[str, dict]:
+    path = blocked_path(cfg)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_blocked(cfg: dict[str, Any], blocked: dict[str, dict]) -> None:
+    path = blocked_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(blocked, indent=2, sort_keys=True) + "\n")
+
+
+def blocked_entries(cfg: dict[str, Any]) -> list[BlockedEntry]:
+    rows: list[BlockedEntry] = []
+    for mac, entry in sorted(load_blocked(cfg).items()):
+        rows.append(
+            BlockedEntry(
+                mac=mac.lower(),
+                last_ip=str(entry.get("last_ip") or "?"),
+                label=str(entry.get("label") or ""),
+                reason=str(entry.get("reason") or ""),
+                blocked_at=str(entry.get("blocked_at") or ""),
+                method=str(entry.get("method") or ""),
+                online=bool(entry.get("online")),
+                last_ping=str(entry.get("last_ping") or ""),
+            )
+        )
+    return rows
+
+
+def is_blocked_mac(cfg: dict[str, Any], mac: str) -> bool:
+    return mac.lower() in load_blocked(cfg)
+
+
+def device_display_name(mac: str, known: dict[str, dict], entry: dict | None = None) -> str:
+    src = entry or known.get(mac.lower(), {})
+    return (
+        (src.get("label") or "").strip()
+        or (src.get("auto_guess") or "").strip()
+        or (src.get("hostname") or "").split(".")[0]
+        or (src.get("vendor") or "").strip()
+        or mac
+    )
+
+
+def ping_check(ip: str, iface: str) -> bool:
+    if not ip or ip.count(".") != 3:
+        return False
+    args = ["ping", "-c", "1", "-W", "1", ip]
+    if iface:
+        args[1:1] = ["-I", iface]
+    return subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+
+def update_blocked_ping_status(cfg: dict[str, Any], iface: str) -> dict[str, dict]:
+    blocked = load_blocked(cfg)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for mac, entry in blocked.items():
+        ip = str(entry.get("last_ip") or "")
+        online = ping_check(ip, iface) if ip else False
+        entry["online"] = online
+        entry["last_ping"] = now
+        blocked[mac] = entry
+    save_blocked(cfg, blocked)
+    return blocked
+
+
+def _sudo_prefix(cfg: dict[str, Any]) -> list[str]:
+    if os.geteuid() == 0:
+        return []
+    if cfg.get("countermeasures", {}).get("sudo_non_interactive", True):
+        return ["sudo", "-n"]
+    return ["sudo"]
+
+
+def _run_priv(cmd: list[str], cfg: dict[str, Any], timeout: int = 10) -> tuple[int, str]:
+    full = _sudo_prefix(cfg) + cmd
+    try:
+        proc = subprocess.run(full, capture_output=True, text=True, timeout=timeout, check=False)
+        out = (proc.stdout or proc.stderr or "").strip()
+        return proc.returncode, out
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return 1, ""
+
+
+def apply_nftables_blocks(cfg: dict[str, Any], blocked: dict[str, dict]) -> tuple[bool, str]:
+    ips = sorted({str(e.get("last_ip")) for e in blocked.values() if e.get("last_ip")})
+    macs = sorted(
+        {
+            str(e.get("mac") or mac).lower().replace("-", ":")
+            for mac, e in blocked.items()
+            if (e.get("mac") or mac)
+        }
+    )
+    use_mac = cfg.get("countermeasures", {}).get("block_by_mac", True)
+    if not ips and not (use_mac and macs):
+        code, _ = _run_priv(["nft", "list", "table", "inet", NFT_TABLE], cfg)
+        if code == 0:
+            _run_priv(["nft", "delete", "table", "inet", NFT_TABLE], cfg)
+        return True, "no blocked targets"
+
+    code, _ = _run_priv(["nft", "list", "table", "inet", NFT_TABLE], cfg)
+    if code != 0:
+        rc, _ = _run_priv(["nft", "add", "table", "inet", NFT_TABLE], cfg)
+        if rc != 0:
+            return False, "nftables: need netwatch --setup (sudo)"
+        _run_priv(
+            [
+                "nft",
+                "add",
+                "chain",
+                "inet",
+                NFT_TABLE,
+                NFT_CHAIN_IN,
+                "{ type filter hook input priority 0; policy accept; }",
+            ],
+            cfg,
+        )
+        _run_priv(
+            [
+                "nft",
+                "add",
+                "chain",
+                "inet",
+                NFT_TABLE,
+                NFT_CHAIN_OUT,
+                "{ type filter hook output priority 0; policy accept; }",
+            ],
+            cfg,
+        )
+
+    _run_priv(["nft", "flush", "chain", "inet", NFT_TABLE, NFT_CHAIN_IN], cfg)
+    _run_priv(["nft", "flush", "chain", "inet", NFT_TABLE, NFT_CHAIN_OUT], cfg)
+    applied = 0
+    for ip in ips:
+        c1, _ = _run_priv(["nft", "add", "rule", "inet", NFT_TABLE, NFT_CHAIN_IN, "ip", "saddr", ip, "drop"], cfg)
+        c2, _ = _run_priv(["nft", "add", "rule", "inet", NFT_TABLE, NFT_CHAIN_OUT, "ip", "daddr", ip, "drop"], cfg)
+        if c1 == 0 and c2 == 0:
+            applied += 1
+    mac_applied = 0
+    if use_mac:
+        for mac in macs:
+            c1, _ = _run_priv(
+                ["nft", "add", "rule", "inet", NFT_TABLE, NFT_CHAIN_IN, "ether", "saddr", mac, "drop"],
+                cfg,
+            )
+            c2, _ = _run_priv(
+                ["nft", "add", "rule", "inet", NFT_TABLE, NFT_CHAIN_OUT, "ether", "daddr", mac, "drop"],
+                cfg,
+            )
+            if c1 == 0 or c2 == 0:
+                mac_applied += 1
+    if applied == 0 and mac_applied == 0:
+        return False, "nftables rules failed — run: netwatch --setup"
+    parts = []
+    if applied:
+        parts.append(f"{applied} IP(s)")
+    if mac_applied:
+        parts.append(f"{mac_applied} MAC(s)")
+    return True, f"pc-firewall ({', '.join(parts)})"
+
+
+def apply_firewalld_blocks(cfg: dict[str, Any], blocked: dict[str, dict]) -> tuple[bool, str]:
+    if not shutil.which("firewall-cmd"):
+        return False, "firewall-cmd not installed"
+    ips = sorted({str(e.get("last_ip")) for e in blocked.values() if e.get("last_ip")})
+    applied = 0
+    for ip in ips:
+        rule = f'rule family="ipv4" source address="{ip}" drop'
+        code, _ = _run_priv(["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"], cfg, timeout=20)
+        if code == 0:
+            applied += 1
+    if applied:
+        _run_priv(["firewall-cmd", "--reload"], cfg, timeout=20)
+    return True, f"firewalld rich rules for {applied} IP(s)"
+
+
+def run_block_script(cfg: dict[str, Any], mac: str, ip: str, action: str) -> tuple[bool, str]:
+    script = expand_path(cfg.get("countermeasures", {}).get("block_script", ""))
+    if not script.is_file():
+        return False, "block script not found"
+    env = os.environ.copy()
+    env.update(
+        {
+            "NETWATCH_MAC": mac,
+            "NETWATCH_IP": ip,
+            "NETWATCH_ACTION": action,
+        }
+    )
+    try:
+        proc = subprocess.run(
+            [str(script), action, mac, ip],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+        msg = (proc.stdout or proc.stderr or "").strip() or f"exit {proc.returncode}"
+        return proc.returncode == 0, msg[:200]
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, str(exc)[:200]
+
+
+def apply_block_rules(
+    cfg: dict[str, Any],
+    blocked: dict[str, dict] | None = None,
+    *,
+    manual: bool = False,
+) -> tuple[bool, str]:
+    cm = cfg.get("countermeasures", {})
+    if not cm.get("enabled", True):
+        return False, "countermeasures disabled"
+    if not manual and cm.get("auto_quarantine", False) is not True:
+        return False, "quarantine is manual-only (press b in identify)"
+    blocked = blocked if blocked is not None else load_blocked(cfg)
+    method = str(cm.get("method") or "full").lower()
+    notes: list[str] = []
+    ok_any = False
+
+    if method in ("full", "nftables", "both"):
+        ok, msg = apply_nftables_blocks(cfg, blocked)
+        notes.append(msg)
+        ok_any = ok_any or ok
+    if method in ("full", "firewalld", "both"):
+        ok, msg = apply_firewalld_blocks(cfg, blocked)
+        notes.append(msg)
+        ok_any = ok_any or ok
+    if method in ("log", "script"):
+        return True, f"registry: {len(blocked)} blocked"
+    if not ok_any and method != "log":
+        return False, " · ".join(notes) or "enforcement failed"
+    return True, " · ".join(notes) or "rules applied"
+
+
+def sync_blocked_from_arp(cfg: dict[str, Any], iface: str) -> tuple[int, str]:
+    """Update blocked IPs from ARP and re-apply rules if a device got a new DHCP lease."""
+    blocked = load_blocked(cfg)
+    if not blocked or not iface:
+        return 0, ""
+    devices = parse_neigh(iface)
+    mac_ip = {d.mac.lower(): d.ip for d in devices}
+    changed = 0
+    for mac, entry in blocked.items():
+        live_ip = mac_ip.get(mac.lower())
+        if live_ip and live_ip != entry.get("last_ip"):
+            entry["last_ip"] = live_ip
+            entry["last_seen"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            changed += 1
+    if not changed:
+        return 0, ""
+    save_blocked(cfg, blocked)
+    apply_block_rules(cfg, blocked, manual=True)
+    return changed, f"updated {changed} blocked IP(s) from ARP"
+
+
+def block_device(
+    cfg: dict[str, Any],
+    mac: str,
+    ip: str,
+    *,
+    label: str = "",
+    reason: str = "",
+    known: dict[str, dict] | None = None,
+    interactive_setup: bool = False,
+) -> tuple[bool, str]:
+    cm = cfg.get("countermeasures", {})
+    if not cm.get("enabled", True):
+        return False, "countermeasures disabled"
+
+    ready, ready_msg = ensure_enforcement_ready(cfg, interactive=interactive_setup)
+    if not ready:
+        return False, ready_msg
+
+    mac = mac.lower()
+    _, gateway, local = default_route()
+    if cm.get("protect_gateway", True) and ip == gateway:
+        return False, "refusing to block gateway"
+    if cm.get("protect_self", True) and ip == local:
+        return False, "refusing to block this PC"
+
+    known = known if known is not None else load_known(expand_path(cfg["alerts"]["state_file"]))
+    name = label.strip() or device_display_name(mac, known)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    method = str(cm.get("method") or "full")
+
+    blocked = load_blocked(cfg)
+    blocked[mac] = {
+        "mac": mac,
+        "last_ip": ip,
+        "label": name,
+        "reason": reason.strip() or "manual block",
+        "blocked_at": now,
+        "method": method,
+        "online": ping_check(ip, default_route()[0]),
+        "last_ping": now,
+        "layers": [],
+    }
+    save_blocked(cfg, blocked)
+
+    layers: list[str] = []
+    ok_pc, msg_pc = apply_block_rules(cfg, blocked, manual=True)
+    if ok_pc:
+        layers.append(msg_pc.split(" · ")[0] if " · " in msg_pc else msg_pc)
+
+    ok_router, msg_router = router_block_mac(cfg, mac, ip, "block")
+    if ok_router and "skip" not in msg_router:
+        layers.append("router-wifi")
+
+    script = expand_path(cm.get("block_script", ""))
+    if script.is_file():
+        s_ok, s_msg = run_block_script(cfg, mac, ip, "block")
+        if s_ok:
+            layers.append("router-hook")
+
+    blocked[mac]["layers"] = layers
+    save_blocked(cfg, blocked)
+
+    if not layers:
+        return False, f"QUARANTINE FAILED — {msg_pc}; router: {msg_router}"
+    detail = ", ".join(layers)
+    return True, f"QUARANTINED {name} ({ip}) — {detail}"
+
+
+def unblock_device(cfg: dict[str, Any], mac: str) -> tuple[bool, str]:
+    mac = mac.lower()
+    blocked = load_blocked(cfg)
+    entry = blocked.pop(mac, None)
+    if not entry:
+        return False, "not in block registry"
+    save_blocked(cfg, blocked)
+    ip = str(entry.get("last_ip") or "")
+    apply_block_rules(cfg, blocked, manual=True)
+    script = expand_path(cfg.get("countermeasures", {}).get("block_script", ""))
+    if script.is_file() and ip:
+        run_block_script(cfg, mac, ip, "unblock")
+    label = str(entry.get("label") or mac)
+    return True, f"unblocked {label}"
+
+
+def load_alert_state() -> dict[str, Any]:
+    if not ALERT_STATE_PATH.is_file():
+        return {"notified_macs": {}}
+    try:
+        data = json.loads(ALERT_STATE_PATH.read_text())
+        return data if isinstance(data, dict) else {"notified_macs": {}}
+    except json.JSONDecodeError:
+        return {"notified_macs": {}}
+
+
+def save_alert_state(state: dict[str, Any]) -> None:
+    ALERT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ALERT_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def should_notify_mac(mac: str, state: dict[str, Any], repeat_hours: int) -> bool:
+    notified = state.get("notified_macs") or {}
+    last = notified.get(mac.lower())
+    if not last:
+        return True
+    try:
+        last_ts = time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return True
+    return (time.time() - last_ts) >= max(1, repeat_hours) * 3600
+
+
+def send_desktop_notify(title: str, body: str) -> bool:
+    if not shutil.which("notify-send"):
+        return False
+    try:
+        subprocess.run(
+            ["notify-send", "-u", "critical", "-a", "netwatch", title, body],
+            check=False,
+            timeout=5,
+        )
+        return True
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def send_alert_email(cfg: dict[str, Any], subject: str, body: str) -> tuple[bool, str]:
+    ec = cfg.get("notifications", {}).get("email", {})
+    if not ec.get("enabled"):
+        return False, "email disabled"
+    to_addr = str(ec.get("to") or "").strip()
+    if not to_addr:
+        return False, "email.to not set in config"
+    user = os.environ.get(str(ec.get("username_env") or "NETWATCH_SMTP_USER"), "")
+    password = os.environ.get(str(ec.get("password_env") or "NETWATCH_SMTP_PASS"), "")
+    if not user or not password:
+        return False, "set SMTP env vars (NETWATCH_SMTP_USER / NETWATCH_SMTP_PASS)"
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = str(ec.get("from") or user)
+    msg["To"] = to_addr
+    msg.set_content(body)
+
+    host = str(ec.get("smtp_host") or "localhost")
+    port = int(ec.get("smtp_port") or 587)
+    use_tls = ec.get("use_tls", True)
+    try:
+        with smtplib.SMTP(host, port, timeout=20) as smtp:
+            if use_tls:
+                smtp.starttls()
+            smtp.login(user, password)
+            smtp.send_message(msg)
+        return True, f"email sent to {to_addr}"
+    except (OSError, smtplib.SMTPException) as exc:
+        return False, str(exc)[:200]
+
+
+def format_unknown_alert(devices: list[LanDevice], known: dict[str, dict]) -> str:
+    lines = ["Unknown device(s) on your LAN:", ""]
+    for dev in devices:
+        name = device_display_name(dev.mac, known)
+        rnd = " [random MAC]" if is_random_mac(dev.mac) else ""
+        lines.append(f"  • {dev.ip}  {dev.mac}  {name}{rnd}  ({dev.state})")
+    lines.extend(["", "Run: netwatch → press i to identify, b to block.", "Ack trusted: press a on dashboard."])
+    return "\n".join(lines)
+
+
+def run_security_check(cfg: dict[str, Any], *, scan: bool = True) -> dict[str, Any]:
+    iface, gateway, local = default_route()
+    result: dict[str, Any] = {
+        "ok": True,
+        "iface": iface,
+        "local": local,
+        "gateway": gateway,
+        "unknown": [],
+        "blocked_online": [],
+        "messages": [],
+    }
+    if not iface or not local:
+        result["ok"] = False
+        result["error"] = "no default route"
+        return result
+
+    if scan:
+        _, summary = house_scan(cfg, iface, local)
+        result["scan_summary"] = summary
+        time.sleep(0.2)
+
+    devices = parse_neigh(iface)
+    known_path = expand_path(cfg["alerts"]["state_file"])
+    known = load_known(known_path)
+    blocked = update_blocked_ping_status(cfg, iface)
+
+    unknown: list[LanDevice] = []
+    for dev in devices:
+        if dev.mac not in known and not is_blocked_mac(cfg, dev.mac):
+            enrich_devices([dev], known, [], cfg, force_refresh=False, network=False)
+            unknown.append(dev)
+        if is_blocked_mac(cfg, dev.mac):
+            dev.notes = "BLOCKED"
+
+    blocked_online = [
+        BlockedEntry(
+            mac=mac,
+            last_ip=str(entry.get("last_ip") or "?"),
+            label=str(entry.get("label") or mac),
+            online=bool(entry.get("online")),
+        )
+        for mac, entry in blocked.items()
+        if entry.get("online")
+    ]
+
+    result["unknown"] = unknown
+    result["blocked_online"] = blocked_online
+
+    if cfg.get("host_exposure", {}).get("enabled", True):
+        known_for_host = load_known(expand_path(cfg["alerts"]["state_file"]))
+        rclients, _ = router_clients(cfg)
+        ts_peers: list[TailscalePeer] = []
+        if cfg["tailscale"].get("enabled", True):
+            ts_peers, _ = tailscale_peers()
+        inbound, new_inbound, bridges, exposed, logins = collect_host_exposure(
+            cfg, known_for_host, rclients, ts_peers
+        )
+        result["inbound"] = inbound
+        result["new_inbound"] = new_inbound
+        result["bridges"] = bridges
+        result["exposed"] = exposed
+        result["login_sessions"] = logins
+
+    return result
+
+
+def deliver_unknown_alerts(cfg: dict[str, Any], unknown: list[LanDevice]) -> list[str]:
+    """Notify only — never quarantine. Blocking requires manual b in identify."""
+    if not cfg.get("notifications", {}).get("enabled", True) or not unknown:
+        return []
+
+    known = load_known(expand_path(cfg["alerts"]["state_file"]))
+    repeat_hours = int(cfg.get("notifications", {}).get("repeat_hours") or 24)
+    state = load_alert_state()
+    notify_list = [d for d in unknown if should_notify_mac(d.mac, state, repeat_hours)]
+    if not notify_list:
+        return ["alert suppressed (already notified recently)"]
+
+    body = format_unknown_alert(notify_list, known)
+    subject = f"[netwatch] {len(notify_list)} unknown device(s) on LAN"
+    messages: list[str] = []
+
+    if cfg.get("notifications", {}).get("desktop", {}).get("enabled", True):
+        if send_desktop_notify(subject, body.replace("\n", " · ")[:240]):
+            messages.append("desktop notification sent")
+
+    ok, msg = send_alert_email(cfg, subject, body)
+    if ok:
+        messages.append(msg)
+    elif cfg.get("notifications", {}).get("email", {}).get("enabled"):
+        messages.append(f"email failed: {msg}")
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for dev in notify_list:
+        state.setdefault("notified_macs", {})[dev.mac.lower()] = now
+    save_alert_state(state)
+    return messages or ["alert recorded"]
+
+
+def format_inbound_alert(flows: list[InboundFlow]) -> str:
+    lines = ["Remote session(s) reaching THIS computer:", ""]
+    for f in flows:
+        tag = " [untrusted]" if f.is_new else ""
+        lines.append(f"  • {f.remote_ip} → port {f.service} ({f.proc or '?'})  {f.name}{tag}")
+    lines.extend(
+        [
+            "",
+            "Run: netwatch → press e for host exposure detail.",
+            "Trust known peers: press T on dashboard.",
+            "This is NOT auto-block — verify SSH/RDP/tunnel access.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def deliver_inbound_alerts(cfg: dict[str, Any], flows: list[InboundFlow]) -> list[str]:
+    he = cfg.get("host_exposure", {})
+    if not he.get("alert_inbound", True) or not flows:
+        return []
+    if not cfg.get("notifications", {}).get("enabled", True):
+        return []
+
+    untrusted = [f for f in flows if f.is_new]
+    if not untrusted:
+        return []
+
+    repeat_hours = int(cfg.get("notifications", {}).get("repeat_hours") or 24)
+    state = load_alert_state()
+    notify_ips = [
+        f.remote_ip
+        for f in untrusted
+        if should_notify_mac(f"inbound:{f.remote_ip}", state, repeat_hours)
+    ]
+    if not notify_ips:
+        return ["inbound alert suppressed (already notified recently)"]
+
+    notify_flows = [f for f in untrusted if f.remote_ip in notify_ips]
+    body = format_inbound_alert(notify_flows)
+    subject = f"[netwatch] {len(notify_flows)} inbound session(s) on your PC"
+    messages: list[str] = []
+
+    if cfg.get("notifications", {}).get("desktop", {}).get("enabled", True):
+        if send_desktop_notify(subject, body.replace("\n", " · ")[:240]):
+            messages.append("desktop inbound notification sent")
+
+    ok, msg = send_alert_email(cfg, subject, body)
+    if ok:
+        messages.append(msg)
+    elif cfg.get("notifications", {}).get("email", {}).get("enabled"):
+        messages.append(f"inbound email failed: {msg}")
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for ip in notify_ips:
+        state.setdefault("notified_macs", {})[f"inbound:{ip}"] = now
+    save_alert_state(state)
+    return messages or ["inbound alert recorded"]
+
+
+def cli_dig_listeners(cfg: dict[str, Any] | None = None, port: str | None = None) -> int:
+    cfg = cfg or load_config()
+    he = cfg.get("host_exposure", {})
+    listener_map = _scan_listener_processes(use_sudo=he.get("resolve_with_sudo", True))
+    if port:
+        info = dig_listener(port, listener_map)
+        print(f"Port {port}")
+        print(f"  process: {info['process']}")
+        if info["pid"]:
+            print(f"  pid:     {info['pid']}")
+        if info["proto"]:
+            print(f"  proto:   {info['proto']}")
+        if info["ss_lines"]:
+            print("  ss:")
+            for line in info["ss_lines"][:6]:
+                print(f"    {line}")
+        if info.get("tip"):
+            print(f"  tip: {info['tip']}")
+        return 0
+
+    exposed = exposed_listeners(cfg, limit=32, listener_map=listener_map)
+    if not exposed:
+        print("No LAN-wide listeners detected.")
+        return 0
+    print(f"{'PORT':<6} {'PROTO':<5} {'RISK':<6} {'PROCESS'}")
+    print("-" * 56)
+    unidentified = 0
+    for e in exposed:
+        label = format_listener_label(e)
+        proto = e.proto or "?"
+        if label == "unidentified":
+            unidentified += 1
+        print(f"{e.port:<6} {proto:<5} {e.risk:<6} {label}  ({e.bind})")
+    print("")
+    print("Dig one port:  netwatch --dig-port 11434")
+    if unidentified:
+        print(
+            f"{unidentified} unidentified — run netwatch --setup once "
+            "(enables dynamic naming for root-owned services via sudo ss/lsof)"
+        )
+    return 0
+
+
+def cli_check(cfg: dict[str, Any] | None = None) -> int:
+    cfg = cfg or load_config()
+    result = run_security_check(cfg, scan=True)
+    if not result.get("ok"):
+        print(f"netwatch-check: ERROR {result.get('error', '?')}", file=sys.stderr)
+        return 1
+
+    unknown: list[LanDevice] = result.get("unknown") or []
+    blocked_online: list[BlockedEntry] = result.get("blocked_online") or []
+    print(result.get("scan_summary", "scan done"))
+    print(f"unknown devices: {len(unknown)}")
+    for dev in unknown:
+        print(f"  ? {dev.ip}  {dev.mac}  {dev.guess or dev.vendor or '?'}")
+    if blocked_online:
+        print(f"blocked but online: {len(blocked_online)}")
+        for b in blocked_online:
+            print(f"  ! {b.label}  {b.last_ip}  ONLINE")
+
+    new_inbound: list[str] = result.get("new_inbound") or []
+    inbound: list[InboundFlow] = result.get("inbound") or []
+    if cfg.get("host_exposure", {}).get("enabled", True):
+        print(f"inbound sessions: {len(inbound)}  untrusted: {len(new_inbound)}")
+        for f in inbound:
+            if f.is_new:
+                print(f"  ! {f.remote_ip} → {f.service}  {f.name}  ({f.proc or '?'})")
+        exposed: list[ExposedListener] = result.get("exposed") or []
+        risky = [e for e in exposed if e.risk == "alert"]
+        if risky:
+            print(f"exposed listeners (LAN-wide): {len(risky)}")
+            for e in risky[:8]:
+                label = format_listener_label(e)
+                proto = f"/{e.proto}" if e.proto else ""
+                print(f"  ! {e.bind}{proto}  {label}")
+
+    exit_code = 0
+    if unknown:
+        for msg in deliver_unknown_alerts(cfg, unknown):
+            print(msg)
+        exit_code = 2
+
+    untrusted_inbound = [f for f in inbound if f.is_new]
+    if untrusted_inbound and cfg.get("host_exposure", {}).get("alert_inbound", True):
+        for msg in deliver_inbound_alerts(cfg, untrusted_inbound):
+            print(msg)
+        exit_code = max(exit_code, 3)
+
+    if exit_code:
+        return exit_code
+    print("all clear")
+    return 0
+
+
+def cli_restore_blocks(cfg: dict[str, Any] | None = None) -> int:
+    cfg = cfg or load_config()
+    cm = cfg.get("countermeasures", {})
+    # Explicit CLI is always allowed; systemd only runs this when restore_on_boot is true.
+    blocked = load_blocked(cfg)
+    if not blocked:
+        return 0
+    ok, msg = apply_block_rules(cfg, blocked, manual=True)
+    print(msg if ok else f"restore failed: {msg}")
+    return 0 if ok else 1
+
+
+def collect_state(
+    cfg: dict[str, Any],
+    iface: str,
+    acknowledge: bool = False,
+    *,
+    force_identify: bool = False,
+    network: bool = True,
+) -> DashboardState:
+    state = DashboardState()
+    devices = parse_neigh(iface) if iface else []
+    known_path = expand_path(cfg["alerts"]["state_file"])
+    known = load_known(known_path)
+    state.router_clients, state.router_note = router_clients(cfg)
+
+    if cfg["alerts"].get("enabled", True):
+        new_macs, known = update_known(known, devices, acknowledge)
+        state.new_macs = new_macs
+        for dev in devices:
+            dev.is_new = dev.mac in new_macs
+    else:
+        new_macs = []
+
+    enrich_devices(
+        devices,
+        known,
+        state.router_clients,
+        cfg,
+        force_refresh=force_identify,
+        network=network,
+    )
+    save_known(known_path, known)
+    state.devices = devices
+
+    if cfg["tailscale"].get("enabled", True):
+        state.tailscale, ts_note = tailscale_peers()
+        state.status = ts_note
+
+    known_for_out = load_known(expand_path(cfg["alerts"]["state_file"]))
+    state.outbound = outbound_flows(
+        cfg,
+        known_for_out,
+        state.router_clients,
+        state.tailscale,
+        limit=10,
+    )
+
+    if cfg.get("countermeasures", {}).get("enabled", True):
+        sync_blocked_from_arp(cfg, iface)
+        state.blocked = blocked_entries(cfg)
+        blocked_macs = {b.mac for b in state.blocked}
+        for dev in devices:
+            if dev.mac in blocked_macs:
+                dev.notes = "BLOCKED"
+                dev.is_new = False
+
+    if cfg.get("host_exposure", {}).get("enabled", True):
+        (
+            state.inbound,
+            state.new_inbound,
+            state.bridges,
+            state.exposed,
+            state.login_sessions,
+        ) = collect_host_exposure(
+            cfg, known_for_out, state.router_clients, state.tailscale
+        )
+
+    return state
+
+
+def reload_labels(cfg: dict[str, Any], iface: str, dash: DashboardState) -> DashboardState:
+    """Reload display fields from disk without network probes (fast, safe in UI)."""
+    known_path = expand_path(cfg["alerts"]["state_file"])
+    known = load_known(known_path)
+    enrich_devices(
+        dash.devices,
+        known,
+        dash.router_clients,
+        cfg,
+        force_refresh=False,
+        network=False,
+    )
+    return dash
+
+
+CYBER_SPINNERS = ("◢◣◢◣", "◣◢◣◢", "◢◣◢◣", "◥◤◥◤")
+CYBER_BAR_LEVELS = "░▒▓█"
+
+# Color pairs — init in init_cyber_theme()
+CP_ALERT = 1
+CP_CYAN = 2
+CP_MAGENTA = 3
+CP_GREEN = 4
+CP_YELLOW = 5
+CP_BLUE = 6
+CP_WHITE = 7
+
+
+def init_cyber_theme() -> None:
+    curses.start_color()
+    curses.use_default_colors()
+    pairs = (
+        (CP_ALERT, curses.COLOR_RED, -1),
+        (CP_CYAN, curses.COLOR_CYAN, -1),
+        (CP_MAGENTA, curses.COLOR_MAGENTA, -1),
+        (CP_GREEN, curses.COLOR_GREEN, -1),
+        (CP_YELLOW, curses.COLOR_YELLOW, -1),
+        (CP_BLUE, curses.COLOR_BLUE, -1),
+        (CP_WHITE, curses.COLOR_WHITE, -1),
+    )
+    for idx, fg, bg in pairs:
+        try:
+            curses.init_pair(idx, fg, bg)
+        except curses.error:
+            pass
+
+
+def cp(pair: int, *, bold: bool = False, dim: bool = False) -> int:
+    attr = curses.color_pair(pair)
+    if bold:
+        attr |= curses.A_BOLD
+    if dim:
+        attr |= curses.A_DIM
+    return attr
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0, width: int | None = None) -> None:
+    if not text:
+        return
+    h, w = win.getmaxyx()
+    if y < 0 or x < 0 or y >= h - 1 or x >= w - 1:
+        return
+    limit = (width if width is not None else w - x) - 1
+    if limit <= 0:
+        return
+    try:
+        win.addnstr(y, x, text[:limit], limit, attr)
+    except curses.error:
+        pass
+
+
+def loader_inner_width(term_w: int) -> int:
+    """Responsive loader width — bigger on large terminals."""
+    if term_w >= 140:
+        return min(term_w - 8, 100)
+    if term_w >= 100:
+        return min(term_w - 6, 86)
+    if term_w >= 80:
+        return min(term_w - 6, 68)
+    return max(36, min(term_w - 4, 52))
+
+
+def loader_title_rule(inner_w: int) -> str:
+    rule_len = max(24, min(inner_w - 16, inner_w // 2 + 12))
+    return "▀" * rule_len
+
+
+def loader_box_row(inner_w: int, content: str = "") -> str:
+    text = content.center(inner_w)[:inner_w]
+    return f"║{text}║"
+
+
+def loader_progress_bar(frame: int, bar_w: int) -> str:
+    """Full-width animated bar; wave slides inside [ ... ]."""
+    inner = max(16, bar_w - 2)
+    wave = max(6, inner // 5)
+    head = (frame * 2) % (inner + wave)
+    cells: list[str] = []
+    for i in range(inner):
+        dist = head - i
+        if dist < 0 or dist >= wave:
+            cells.append(CYBER_BAR_LEVELS[0])
+        else:
+            level = min(3, (dist * 4) // max(1, wave))
+            cells.append(CYBER_BAR_LEVELS[level])
+    return f"[{''.join(cells)}]"
+
+
+def cyber_pulse(frame: int) -> str:
+    return CYBER_SPINNERS[frame % len(CYBER_SPINNERS)]
+
+
+def draw_cyber_loader(stdscr, status: str, frame: int) -> None:
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+
+    inner_w = loader_inner_width(w)
+    bar_w = max(20, inner_w - 8)
+    spin = cyber_pulse(frame)
+    stat = (status or "SYNC").upper()[: max(6, inner_w // 4)]
+
+    top = "╔" + ("═" * inner_w) + "╗"
+    bottom = "╚" + ("═" * inner_w) + "╝"
+    bar = loader_progress_bar(frame, bar_w)
+    art = [
+        top,
+        loader_box_row(inner_w),
+        loader_box_row(inner_w, "▄▐  N E T W A T C H  ▐▄  // v2.0"),
+        loader_box_row(inner_w, loader_title_rule(inner_w)),
+        loader_box_row(inner_w),
+        loader_box_row(inner_w, f"{spin}   {stat}"),
+        loader_box_row(inner_w, bar),
+        loader_box_row(inner_w, ">> uplink // probe // sync <<"),
+        loader_box_row(inner_w),
+        bottom,
+    ]
+
+    box_w = inner_w + 2
+    box_h = len(art)
+    y0 = max(0, (h - box_h - 2) // 2)
+    x0 = max(0, (w - box_w) // 2)
+
+    for i, line in enumerate(art):
+        y = y0 + i
+        if y >= h - 1:
+            break
+        if i == 0 or i == box_h - 1:
+            attr = cp(CP_CYAN, bold=True)
+        elif i in (2, 3, 6, 7):
+            attr = cp(CP_CYAN, bold=True)
+        elif i == 5:
+            attr = cp(CP_MAGENTA, bold=True)
+        else:
+            attr = cp(CP_MAGENTA, dim=True)
+        safe_addstr(stdscr, y, x0, line[: box_w - 1], attr, box_w)
+
+    tagline = "◈ NEURAL LINK ESTABLISHING ◈"
+    safe_addstr(
+        stdscr,
+        min(h - 1, y0 + box_h + 1),
+        max(0, (w - len(tagline)) // 2),
+        tagline,
+        cp(CP_YELLOW, dim=True),
+    )
+    stdscr.refresh()
+
+
+def cyber_transition(stdscr, label: str, frames: int = 3) -> None:
+    for i in range(max(1, frames)):
+        draw_cyber_loader(stdscr, label, i)
+        time.sleep(0.045)
+
+
+NAV_TRANSITION_FRAMES = 3
+
+
+def cyber_screen_enter(stdscr, label: str) -> None:
+    cyber_transition(stdscr, label, frames=NAV_TRANSITION_FRAMES)
+
+
+def cyber_screen_exit(stdscr, label: str = "BACK") -> None:
+    cyber_transition(stdscr, label, frames=NAV_TRANSITION_FRAMES)
+
+
+def run_with_cyber_loader(stdscr, status: str, func, *args, **kwargs):
+    result: list[Any] = []
+    error: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            result.append(func(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 — surface in UI thread
+            error.append(exc)
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    frame = 0
+    while thread.is_alive():
+        draw_cyber_loader(stdscr, status, frame)
+        frame += 1
+        time.sleep(0.065)
+    if error:
+        raise error[0]
+    cyber_transition(stdscr, "ONLINE", frames=NAV_TRANSITION_FRAMES)
+    return result[0]
+
+
+def draw_cyber_panel(
+    win,
+    y: int,
+    x: int,
+    h: int,
+    w: int,
+    title: str,
+    *,
+    pair: int = CP_CYAN,
+) -> None:
+    if h < 3 or w < 6:
+        return
+    tl, tr, bl, br, hz, vt = "╔", "╗", "╚", "╝", "═", "║"
+    title_text = f"◈ {title.upper()} ◈"
+    inner_w = w - 2
+    if len(title_text) + 4 > inner_w:
+        title_text = title_text[: max(4, inner_w - 5)] + "…"
+    pad = max(0, inner_w - len(title_text))
+    left_pad = pad // 2
+    top = tl + (hz * left_pad) + title_text + (hz * (pad - left_pad)) + tr
+    safe_addstr(win, y, x, top[: w - 1], cp(pair, bold=True), w)
+    for row in range(y + 1, y + h - 1):
+        safe_addstr(win, row, x, vt, cp(pair))
+        safe_addstr(win, row, x + w - 1, vt, cp(pair))
+    safe_addstr(win, y + h - 1, x, bl + (hz * inner_w) + br[:1], cp(pair), w)
+
+
+def draw_cyber_hud_bar(win, y: int, w: int, left: str, right: str, *, pair: int = CP_MAGENTA) -> None:
+    if y >= win.getmaxyx()[0] - 1 or w < 8:
+        return
+    safe_addstr(win, y, 0, "▌", cp(pair, bold=True))
+    safe_addstr(win, y, 1, left[: max(0, w - len(right) - 4)], cp(CP_CYAN, bold=True), w - len(right) - 2)
+    safe_addstr(win, y, max(1, w - len(right) - 1), right[: w - 2], cp(CP_YELLOW, dim=True))
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    header = (
+        "# Netwatch configuration — ~/.config/netwatch/config.yaml\n"
+        "# Edit here or press O in the dashboard. Press R to reload.\n\n"
+    )
+    CONFIG_PATH.write_text(header + yaml.dump(cfg, default_flow_style=False, sort_keys=False))
+
+
+def cfg_get(cfg: dict[str, Any], path: list[str]) -> Any:
+    node: Any = cfg
+    for key in path:
+        node = node[key]
+    return node
+
+
+def cfg_set(cfg: dict[str, Any], path: list[str], value: Any) -> None:
+    node = cfg
+    for key in path[:-1]:
+        node = node.setdefault(key, {})
+    node[path[-1]] = value
+
+
+def panels_per_page(cfg: dict[str, Any]) -> int:
+    display = cfg.get("display", {})
+    return max(1, int(display.get("panels_per_page") or display.get("page_size") or 4))
+
+
+def items_per_panel(cfg: dict[str, Any]) -> int:
+    return max(1, int(cfg.get("display", {}).get("items_per_panel") or 15))
+
+
+def panel_page_count(total_panels: int, cfg: dict[str, Any]) -> int:
+    per = panels_per_page(cfg)
+    return max(1, (total_panels + per - 1) // per)
+
+
+def advance_panel_page(current: int, total_panels: int, cfg: dict[str, Any]) -> int:
+    pages = panel_page_count(total_panels, cfg)
+    return (current + 1) % pages
+
+
+def retreat_panel_page(current: int, total_panels: int, cfg: dict[str, Any]) -> int:
+    pages = panel_page_count(total_panels, cfg)
+    return (current - 1) % pages
+
+
+@dataclass
+class DashboardPanel:
+    panel_id: str
+    title: str
+    pair: int
+    lines: list[str]
+    line_attrs: list[int] | None = None
+    total: int = 0
+
+
+def build_dashboard_panels(
+    cfg: dict[str, Any],
+    dash: DashboardState,
+    scanned: bool,
+) -> list[DashboardPanel]:
+    """Build all panel containers dynamically from config + live state."""
+    cap = items_per_panel(cfg)
+    panels: list[DashboardPanel] = []
+    he = cfg.get("host_exposure", {})
+    router_on = cfg["router"].get("enabled") and (cfg["router"].get("type") or "disabled").lower() != "disabled"
+
+    lan_lines: list[str] = []
+    lan_attrs: list[int] = []
+    if scanned:
+        lan_lines.append("◈ post house-scan sweep")
+        lan_attrs.append(cp(CP_MAGENTA, bold=True))
+    for d in dash.devices[:cap]:
+        tag = " ▸NEW" if d.is_new else ""
+        if is_blocked_mac(cfg, d.mac):
+            tag = " ⛔BLOCK"
+        name = (d.label or d.guess or d.hostname or "?")[:14]
+        lan_lines.append(f"{d.ip:<15} {name:<14}{tag}")
+        lan_attrs.append(_lan_line_attr(d, scanned))
+    panels.append(
+        DashboardPanel(
+            "lan",
+            "LAN :: nodes",
+            CP_CYAN,
+            lan_lines or ["(no nodes — S·house scan)"],
+            lan_attrs or None,
+            total=len(dash.devices),
+        )
+    )
+
+    if cfg["tailscale"].get("enabled", True):
+        ts_lines: list[str] = []
+        ts_attrs: list[int] = []
+        for p in dash.tailscale[:cap]:
+            glyph = "◉" if p.online else "○"
+            ts_lines.append(f"{glyph} {p.name[:18]:<18} {p.ip}")
+            ts_attrs.append(cp(CP_GREEN, bold=True) if p.online else cp(CP_BLUE, dim=True))
+        panels.append(
+            DashboardPanel(
+                "tailscale",
+                "MESH :: tailscale",
+                CP_MAGENTA,
+                ts_lines or ["(mesh offline)"],
+                ts_attrs or None,
+                total=len(dash.tailscale),
+            )
+        )
+
+    if router_on:
+        rlines = [f"◈ {(c.name or '?')[:12]:<12} {c.ip}" for c in dash.router_clients[:cap]]
+        panels.append(
+            DashboardPanel(
+                "router",
+                "ROUTER :: dhcp",
+                CP_YELLOW,
+                rlines or ["(no uplink data)"],
+                total=len(dash.router_clients),
+            )
+        )
+
+    out_w = 36
+    out_lines = format_outbound_lines(dash.outbound, out_w, limit=cap)
+    panels.append(
+        DashboardPanel(
+            "outbound",
+            "NET :: outbound",
+            CP_GREEN,
+            out_lines,
+            total=len(dash.outbound),
+        )
+    )
+
+    if he.get("enabled", True):
+        if he.get("monitor_inbound", True):
+            in_lines = format_inbound_lines(dash.inbound, 32, limit=cap)
+            in_attrs = [
+                cp(CP_ALERT, bold=True) if f.is_new else cp(CP_WHITE, dim=True)
+                for f in dash.inbound[:cap]
+            ]
+            if in_lines and in_lines[0].startswith("REMOTE"):
+                in_attrs = [cp(CP_CYAN, dim=True)] + (in_attrs or [])
+            panels.append(
+                DashboardPanel(
+                    "inbound",
+                    "HOST :: inbound",
+                    CP_ALERT,
+                    in_lines or ["(no inbound sessions)"],
+                    in_attrs,
+                    total=len(dash.inbound),
+                )
+            )
+
+        if he.get("monitor_listeners", True):
+            exp_lines = [
+                f"{'!' if e.risk == 'alert' else '·'} :{e.port} {format_listener_label(e)}"[:34]
+                for e in dash.exposed[:cap]
+            ]
+            panels.append(
+                DashboardPanel(
+                    "exposed",
+                    "HOST :: exposed",
+                    CP_YELLOW,
+                    exp_lines or ["(no LAN listeners)"],
+                    total=len(dash.exposed),
+                )
+            )
+
+        if he.get("monitor_bridges", True):
+            path_lines: list[str] = []
+            for b in dash.bridges[:cap]:
+                path_lines.append(f"◈ {b.name} ({b.state})")
+                path_lines.append(f"  {b.note[:30]}")
+            if dash.login_sessions:
+                path_lines.append("── logins ──")
+                path_lines.extend(dash.login_sessions[: max(1, cap // 3)])
+            panels.append(
+                DashboardPanel(
+                    "paths",
+                    "HOST :: paths",
+                    CP_MAGENTA,
+                    path_lines or ["(no bridges/tunnels)"],
+                    total=len(dash.bridges) + len(dash.login_sessions),
+                )
+            )
+
+    defense = [f"◈ fw · {firewall_state()[:22]}"]
+    defense.extend(quarantine_lines(dash.blocked, min(cap, 8)))
+    defense.extend(failed_logins()[: max(0, cap - len(defense))])
+    panels.append(
+        DashboardPanel(
+            "defense",
+            "DEF :: perimeter",
+            CP_ALERT,
+            defense,
+            total=len(dash.blocked),
+        )
+    )
+
+    return panels
+
+
+CONFIG_TOGGLES: list[tuple[list[str], str]] = [
+    (["alerts", "enabled"], "Alerts — track unknown MACs"),
+    (["alerts", "banner"], "Banner on unknown devices"),
+    (["tailscale", "enabled"], "Tailscale mesh panel"),
+    (["router", "enabled"], "Router client panel"),
+    (["host_exposure", "enabled"], "Host exposure monitoring"),
+    (["host_exposure", "monitor_inbound"], "Inbound sessions panel"),
+    (["host_exposure", "monitor_listeners"], "Exposed listeners panel"),
+    (["host_exposure", "monitor_bridges"], "Bridges / paths panel"),
+    (["host_exposure", "banner"], "Host exposure banner"),
+    (["host_exposure", "alert_inbound"], "Alert on inbound sessions"),
+    (["host_exposure", "resolve_with_sudo"], "Resolve listener PIDs via sudo"),
+    (["countermeasures", "enabled"], "Countermeasures (block/quarantine)"),
+    (["countermeasures", "restore_on_boot"], "Re-apply blocks after reboot"),
+    (["countermeasures", "block_by_mac"], "Firewall block by MAC address"),
+    (["countermeasures", "router_block", "enabled"], "Router Wi‑Fi MAC deny"),
+    (["notifications", "enabled"], "Notifications (cron/check)"),
+    (["notifications", "desktop", "enabled"], "Desktop notifications"),
+    (["identify", "auto_enrich"], "Auto-enrich device names"),
+    (["identify", "auto_probe_unknown"], "Auto-probe unknown devices"),
+    (["harnesses", "enabled"], "YAML probe harnesses"),
+    (["scan", "use_nmap_if_available"], "Use nmap for house scan"),
+]
+
+
+def show_options(stdscr, cfg: dict[str, Any]) -> str:
+    cyber_screen_enter(stdscr, "OPTS")
+    cfg = load_config()
+    ttl = status_flash_seconds(cfg)
+    pane = "settings"
+    sel = 0
+    kb_sel = 0
+    capture_action: str | None = None
+    legend = "tab pane · ↑↓ select · space toggle/rebind · s save · q close"
+    ui_status = FlashStatus(legend, ttl=ttl)
+    stdscr.timeout(IDLE_TIMEOUT_MS)
+    try:
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            footer = ui_status.current()
+            if capture_action:
+                footer = f"Press key for {DEFAULT_KEYBINDINGS[capture_action][0]} · Esc cancel"
+            draw_cyber_hud_bar(stdscr, 0, w, " OPTIONS // NETWATCH CONFIG ", footer, pair=CP_CYAN)
+
+            left_w = max(28, (w - 3) // 2)
+            settings_title = "SETTINGS" if pane == "settings" else "SETTINGS (tab)"
+            keys_title = "KEYBINDINGS" if pane == "keys" else "KEYBINDINGS (tab)"
+            draw_cyber_panel(stdscr, 2, 0, h - 4, left_w, settings_title, pair=CP_GREEN)
+            toggle_items: list[tuple[list[str], str, bool]] = []
+            for path, label in CONFIG_TOGGLES:
+                try:
+                    val = cfg_get(cfg, path)
+                except (KeyError, TypeError):
+                    continue
+                if isinstance(val, bool):
+                    toggle_items.append((path, label, val))
+
+            opt_lines: list[str] = []
+            opt_attrs: list[int] = []
+            for i, (path, label, val) in enumerate(toggle_items):
+                mark = "ON " if val else "OFF"
+                line = f"[{mark}] {label}"
+                opt_lines.append(line[: left_w - 4])
+                if pane == "settings" and i == sel:
+                    attr = cp(CP_CYAN, bold=True)
+                else:
+                    attr = cp(CP_WHITE, dim=True)
+                opt_attrs.append(attr)
+            sel = min(sel, max(0, len(toggle_items) - 1))
+            put_lines(stdscr, 3, 2, left_w - 4, opt_lines, cp(CP_WHITE), line_attrs=opt_attrs)
+
+            draw_cyber_panel(stdscr, 2, left_w + 1, h - 4, w - left_w - 2, keys_title, pair=CP_MAGENTA)
+            kb_items = binding_rows(cfg)
+            kb_lines: list[str] = []
+            kb_attrs: list[int] = []
+            for i, (_action, key, desc) in enumerate(kb_items):
+                mark = "▸" if pane == "keys" and i == kb_sel else " "
+                kb_lines.append(f"{mark}{key:<7} {desc}"[: w - left_w - 6])
+                if pane == "keys" and i == kb_sel:
+                    kb_attrs.append(cp(CP_MAGENTA, bold=True))
+                else:
+                    kb_attrs.append(cp(CP_MAGENTA, dim=True))
+            kb_sel = min(kb_sel, max(0, len(kb_items) - 1))
+            put_lines(
+                stdscr,
+                3,
+                left_w + 3,
+                w - left_w - 6,
+                kb_lines,
+                cp(CP_MAGENTA, dim=True),
+                line_attrs=kb_attrs,
+            )
+
+            draw_cyber_footer(stdscr, h - 1, w, footer, cfg)
+            stdscr.refresh()
+
+            if capture_action:
+                stdscr.timeout(-1)
+                ch = stdscr.getch()
+                stdscr.timeout(IDLE_TIMEOUT_MS)
+                if ch in (27,):
+                    capture_action = None
+                    ui_status.flash("rebind cancelled")
+                    continue
+                msg = set_keybinding(cfg, capture_action, ch)
+                capture_action = None
+                ui_status.flash(msg)
+                continue
+
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            if ch in (ord("q"), ord("Q"), 27):
+                cyber_screen_exit(stdscr)
+                return ""
+            if ch in (ord("s"), ord("S")):
+                save_config(cfg)
+                cyber_screen_exit(stdscr)
+                return "options saved — press R to reload"
+            if ch == 9:
+                pane = "keys" if pane == "settings" else "settings"
+                continue
+            if ch in (curses.KEY_UP, ord("k")):
+                if pane == "settings":
+                    sel = max(0, sel - 1)
+                else:
+                    kb_sel = max(0, kb_sel - 1)
+            if ch in (curses.KEY_DOWN, ord("j")):
+                if pane == "settings":
+                    sel = min(len(opt_lines) - 1, sel + 1)
+                else:
+                    kb_sel = min(len(kb_items) - 1, kb_sel + 1)
+            if ch in (10, 13, ord(" ")):
+                if pane == "settings" and toggle_items:
+                    path, _label, val = toggle_items[sel]
+                    cfg_set(cfg, path, not val)
+                    ui_status.flash(f"toggled {'.'.join(path)}")
+                elif pane == "keys" and kb_items:
+                    capture_action = kb_items[kb_sel][0]
+    finally:
+        stdscr.timeout(IDLE_TIMEOUT_MS)
+
+
+def paginate_slice(
+    items: list[Any],
+    scroll: int,
+    *,
+    page_sz: int,
+    max_rows: int,
+) -> tuple[list[Any], int, int]:
+    cap = max(1, min(page_sz, max_rows))
+    total = len(items)
+    if total == 0:
+        return [], 0, 0
+    max_scroll = max(0, total - cap)
+    scroll = max(0, min(scroll, max_scroll))
+    return items[scroll : scroll + cap], scroll, total
+
+
+def panel_scroll_label(scroll: int, visible: int, total: int) -> str:
+    if total <= visible:
+        return ""
+    end = min(scroll + visible, total)
+    return f" [{scroll + 1}-{end}/{total}]"
+
+
+def advance_scroll(scroll: int, page_sz: int, total: int, max_rows: int) -> int:
+    cap = max(1, min(page_sz, max_rows))
+    if total <= cap:
+        return 0
+    max_scroll = max(0, total - cap)
+    next_scroll = scroll + page_sz
+    return 0 if next_scroll > max_scroll else next_scroll
+
+
+def retreat_scroll(scroll: int, page_sz: int) -> int:
+    return max(0, scroll - page_sz)
+
+
+def unknown_devices(devices: list[LanDevice], cfg: dict[str, Any]) -> list[LanDevice]:
+    return [d for d in devices if d.is_new and not is_blocked_mac(cfg, d.mac)]
+
+
+def quarantine_lines(blocked: list[BlockedEntry], limit: int = 4) -> list[str]:
+    if not blocked:
+        return ["◈ quarantine · empty"]
+    online = sum(1 for b in blocked if b.online)
+    lines = [f"◈ quarantine · {len(blocked)} blocked · {online} online"]
+    for entry in blocked[:limit]:
+        glyph = "◉ ONLINE" if entry.online else "○ offline"
+        name = (entry.label or entry.mac)[:14]
+        lines.append(f"  {name:<14} {entry.last_ip} {glyph}")
+    if len(blocked) > limit:
+        lines.append(f"  … +{len(blocked) - limit} more")
+    return lines
+
+
+def status_flash_seconds(cfg: dict[str, Any]) -> float:
+    try:
+        return max(0.5, float(cfg.get("display", {}).get("status_flash_seconds") or STATUS_FLASH_SEC))
+    except (TypeError, ValueError):
+        return STATUS_FLASH_SEC
+
+
+class FlashStatus:
+    """Transient footer/hud messages that revert to the key legend after a timeout."""
+
+    def __init__(self, legend: str, *, ttl: float = STATUS_FLASH_SEC):
+        self.legend = legend
+        self.ttl = ttl
+        self._flash = ""
+        self._until = 0.0
+
+    def flash(self, msg: str, ttl: float | None = None) -> None:
+        text = (msg or "").strip()
+        if not text or text == self.legend:
+            return
+        self._flash = text
+        self._until = time.monotonic() + (self.ttl if ttl is None else ttl)
+
+    def current(self) -> str:
+        if self._flash and time.monotonic() < self._until:
+            return self._flash
+        self._flash = ""
+        return self.legend
+
+
+def draw_cyber_footer(win, y: int, w: int, status: str, cfg: dict[str, Any] | None = None) -> None:
+    if y >= win.getmaxyx()[0] - 1 or w < 10:
+        return
+    keys = dashboard_footer_keys(cfg) if cfg else " W/w·panels  O·opts  B·block  G·list  R·sync  H·?  Q·exit "
+    msg = f" ▸ {status} "
+    safe_addstr(win, y, 0, msg[: w - len(keys) - 1], cp(CP_GREEN))
+    safe_addstr(win, y, max(0, w - len(keys) - 1), keys[: w - 1], cp(CP_CYAN, dim=True))
+
+
+def put_lines(
+    win,
+    y: int,
+    x: int,
+    w: int,
+    lines: list[str],
+    attr: int = 0,
+    *,
+    line_attrs: list[int] | None = None,
+) -> int:
+    row = y
+    max_y = win.getmaxyx()[0] - 1
+    for i, line in enumerate(lines):
+        if row >= max_y:
+            break
+        line_attr = line_attrs[i] if line_attrs and i < len(line_attrs) else attr
+        safe_addstr(win, row, x, line[: max(0, w - 1)], line_attr, w)
+        row += 1
+    return row
+
+
+def prompt_line(stdscr, y: int, text: str, w: int) -> str:
+    curses.echo()
+    curses.curs_set(1)
+    try:
+        stdscr.move(y, 0)
+        stdscr.clrtoeol()
+        safe_addstr(stdscr, y, 0, text[: w - 1], cp(CP_YELLOW, bold=True), w)
+        stdscr.refresh()
+        raw = stdscr.getstr(y, len(text), w - len(text) - 1)
+        return raw.decode("utf-8", errors="replace").strip()
+    finally:
+        curses.noecho()
+        curses.curs_set(0)
+
+
+def help_line_attr(line: str) -> int:
+    if line.startswith("──"):
+        return cp(CP_MAGENTA, bold=True)
+    if line.startswith("NETWATCH"):
+        return cp(CP_CYAN, bold=True)
+    if line.startswith("  ") and any(k in line for k in ("Press", "Unknown MAC", "Tip:")):
+        return cp(CP_YELLOW, dim=True)
+    if line.startswith("    ") or line.startswith("  "):
+        return cp(CP_GREEN, dim=True)
+    return cp(CP_WHITE, dim=True)
+
+
+def identify_rows(
+    devices: list[LanDevice], width: int, cfg: dict[str, Any] | None = None
+) -> tuple[list[str], list[int]]:
+    header = f"{'#':>2}  {'IP':<15} {'NAME/GUESS':<16} {'VENDOR':<14} {'MAC':<17} NOTES"
+    sep = "──" + ("─" * min(width - 3, len(header) - 2))
+    rows = [header, sep]
+    attrs = [cp(CP_CYAN, bold=True), cp(CP_MAGENTA, dim=True)]
+    for i, d in enumerate(devices, 1):
+        mark = "▸" if d.is_new else " "
+        if cfg and is_blocked_mac(cfg, d.mac):
+            mark = "⛔"
+        name = (d.label or d.guess)[:16]
+        vendor = (d.vendor or "?")[:14]
+        notes = d.notes or d.state
+        if d.hostname and not d.label:
+            notes = f"{d.hostname[:20]} {notes}".strip()
+        rows.append(
+            f"{mark}{i:>2}  {d.ip:<15} {name:<16} {vendor:<14} {d.mac} {notes}"[: width - 1]
+        )
+        if cfg and is_blocked_mac(cfg, d.mac):
+            attrs.append(cp(CP_YELLOW, bold=True))
+        elif d.is_new:
+            attrs.append(cp(CP_ALERT, bold=True))
+        elif d.label:
+            attrs.append(cp(CP_GREEN))
+        else:
+            attrs.append(cp(CP_WHITE, dim=True))
+    return rows, attrs
+
+
+def quick_block_unknown(stdscr, cfg: dict[str, Any], devices: list[LanDevice]) -> str:
+    unknown = unknown_devices(devices, cfg)
+    if not unknown:
+        return "no unknown devices — press G for block registry"
+    cyber_screen_enter(stdscr, "QUARANTINE")
+    h, w = stdscr.getmaxyx()
+    lines = [f"{i + 1}. {d.ip}  {d.mac}  {d.guess or d.vendor or '?'}" for i, d in enumerate(unknown[:12])]
+    stdscr.erase()
+    draw_cyber_hud_bar(stdscr, 0, w, " QUARANTINE // block unknown device ", "q·cancel", pair=CP_ALERT)
+    put_lines(stdscr, 2, 2, w - 4, lines, cp(CP_ALERT, bold=True))
+    num = prompt_line(stdscr, h - 3, "▸ row # to QUARANTINE (cut + registry): ", w)
+    if not num.isdigit():
+        cyber_screen_exit(stdscr)
+        return "block cancelled"
+    idx = int(num) - 1
+    if idx < 0 or idx >= len(unknown):
+        cyber_screen_exit(stdscr)
+        return "invalid row"
+    dev = unknown[idx]
+    ok, msg = block_device(cfg, dev.mac, dev.ip, label=dev.guess or dev.vendor, reason="dashboard block")
+    cyber_screen_exit(stdscr)
+    return msg if ok else f"block failed: {msg}"
+
+
+def show_quarantine_registry(stdscr, cfg: dict[str, Any], iface: str) -> str:
+    cyber_screen_enter(stdscr, "BLOCK")
+    cfg = load_config()
+    ttl = status_flash_seconds(cfg)
+    scroll = 0
+    legend = "X·unblock row · W/w·scroll · q·back"
+    ui_status = FlashStatus(legend, ttl=ttl)
+    stdscr.timeout(IDLE_TIMEOUT_MS)
+    try:
+        while True:
+            cfg = load_config()
+            dash = collect_state(cfg, iface, network=False)
+            blocked = dash.blocked
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            footer = ui_status.current()
+            draw_cyber_hud_bar(
+                stdscr,
+                0,
+                w,
+                f" QUARANTINE REGISTRY // {len(blocked)} blocked ",
+                footer,
+                pair=CP_ALERT,
+            )
+            psize = items_per_panel(cfg)
+            max_rows = h - 6
+            page, scroll, total = paginate_slice(blocked, scroll, page_sz=psize, max_rows=max_rows)
+            title = f"BLOCKED DEVICES{panel_scroll_label(scroll, min(psize, max_rows), total)}"
+            draw_cyber_panel(stdscr, 2, 0, h - 4, w, title, pair=CP_YELLOW)
+            rows: list[str] = []
+            for i, entry in enumerate(page, start=scroll + 1):
+                glyph = "◉" if entry.online else "○"
+                layers = entry.method or "manual"
+                rows.append(f"{i:2}. {entry.label[:16]:<16} {entry.last_ip:<15} {glyph}")
+                rows.append(f"    {entry.mac}  {entry.reason[:28]}")
+            put_lines(
+                stdscr,
+                3,
+                2,
+                w - 4,
+                rows or ["(registry empty — press B on dashboard to block unknown)"],
+                cp(CP_YELLOW, dim=True),
+            )
+            draw_cyber_footer(stdscr, h - 1, w, footer)
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            if ch in (ord("q"), ord("Q"), 27):
+                cyber_screen_exit(stdscr)
+                return ""
+            if ch in (ord("w"), ord("W")):
+                if ch == ord("W"):
+                    scroll = advance_scroll(scroll, psize, total, max_rows)
+                else:
+                    scroll = retreat_scroll(scroll, psize)
+            if ch in (ord("x"), ord("X")):
+                num = prompt_line(stdscr, h - 3, "▸ row # to unblock: ", w)
+                if num.isdigit():
+                    idx = int(num) - 1
+                    if 0 <= idx < len(blocked):
+                        ok, msg = unblock_device(cfg, blocked[idx].mac)
+                        ui_status.flash(msg if ok else f"unblock failed: {msg}")
+                    else:
+                        ui_status.flash("row out of range")
+            if ch in (ord("r"), ord("R")):
+                ui_status.flash(f"refresh {time.strftime('%H:%M:%S')}")
+    finally:
+        stdscr.timeout(IDLE_TIMEOUT_MS)
+
+
+def show_identify(stdscr, cfg: dict[str, Any], iface: str) -> str:
+    cfg = load_config()
+    ok, msg = gate_capability(stdscr, cfg, check_identify_gap(cfg))
+    if not ok:
+        return msg if msg != "cancelled" else ""
+    ttl = status_flash_seconds(cfg)
+    offset = 0
+    legend = "n probe · l label · b block · x unblock · m import · r refresh · q back"
+    ui_status = FlashStatus(legend, ttl=ttl)
+    frame = 0
+    stdscr.timeout(IDLE_TIMEOUT_MS)
+    try:
+        cyber_screen_enter(stdscr, "IDENTIFY")
+        dash = run_with_cyber_loader(
+            stdscr, "PROBE", collect_state, cfg, iface, False, force_identify=True
+        )
+        while True:
+            rows, row_attrs = identify_rows(dash.devices, stdscr.getmaxyx()[1], cfg)
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            pulse = cyber_pulse(frame)
+            frame += 1
+            left = (
+                f" NETWATCH // IDENTIFY  {pulse}  "
+                f"nodes {len(dash.devices)}  new {len(dash.new_macs)} "
+            )
+            draw_cyber_hud_bar(stdscr, 0, w, left, "▸ q·back ", pair=CP_MAGENTA)
+            safe_addstr(
+                stdscr,
+                1,
+                0,
+                ("═" * max(0, w - 1))[: w - 1],
+                cp(CP_CYAN, dim=True),
+            )
+            visible = h - 5
+            for i in range(visible):
+                idx = offset + i
+                if idx >= len(rows):
+                    break
+                safe_addstr(stdscr, i + 2, 2, rows[idx], row_attrs[idx], w - 3)
+            safe_addstr(stdscr, h - 3, 0, ("─" * max(0, w - 1))[: w - 1], cp(CP_MAGENTA, dim=True))
+            safe_addstr(stdscr, h - 2, 2, ui_status.current()[: w - 4], cp(CP_YELLOW, dim=True))
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            if ch in (ord("q"), ord("Q"), 27):
+                cyber_screen_exit(stdscr)
+                return ""
+            if ch in (curses.KEY_UP, ord("k")) and offset > 0:
+                offset -= 1
+            if ch in (curses.KEY_DOWN, ord("j")) and offset + visible < len(rows):
+                offset += 1
+            if ch in (ord("r"), ord("R")):
+                devices = parse_neigh(iface) if iface else []
+                dash.devices = devices
+                dash = reload_labels(cfg, iface, dash)
+                ui_status.flash("list refreshed (no network probe)")
+            if ch in (ord("n"), ord("N")):
+                dash = run_with_cyber_loader(
+                    stdscr,
+                    "SCAN",
+                    collect_state,
+                    cfg,
+                    iface,
+                    False,
+                    force_identify=True,
+                    network=True,
+                )
+                ui_status.flash("probed hostnames, vendors, and unknown devices")
+            if ch in (ord("m"), ord("M")):
+                n = merge_manual_labels(cfg)
+                dash = reload_labels(cfg, iface, dash)
+                ui_status.flash(f"imported {n} label(s) from router-manual.json")
+            if ch in (ord("l"), ord("L")):
+                num = prompt_line(stdscr, h - 3, "▸ row # to label: ", w)
+                if not num.isdigit():
+                    ui_status.flash("invalid row number")
+                    continue
+                idx = int(num) - 1
+                if idx < 0 or idx >= len(dash.devices):
+                    ui_status.flash("row out of range")
+                    continue
+                dev = dash.devices[idx]
+                label = prompt_line(stdscr, h - 3, f"▸ label for {dev.ip} ({dev.guess}): ", w)
+                if label:
+                    set_device_label(cfg, dev.mac, label)
+                    dash = reload_labels(cfg, iface, dash)
+                    ui_status.flash(f"saved label '{label}'")
+            if ch in (ord("b"), ord("B")):
+                ok_gate, gate_msg = gate_capability(stdscr, cfg, check_countermeasures_gap(cfg))
+                if not ok_gate:
+                    ui_status.flash(
+                        gate_msg if gate_msg != "cancelled" else "block cancelled"
+                    )
+                    continue
+                if gate_msg:
+                    ui_status.flash(gate_msg)
+                num = prompt_line(stdscr, h - 3, "▸ row # to block: ", w)
+                if not num.isdigit():
+                    ui_status.flash("invalid row number")
+                    continue
+                idx = int(num) - 1
+                if idx < 0 or idx >= len(dash.devices):
+                    ui_status.flash("row out of range")
+                    continue
+                dev = dash.devices[idx]
+                reason = prompt_line(stdscr, h - 3, f"▸ reason to block {dev.ip}: ", w)
+                ok, msg = block_device(cfg, dev.mac, dev.ip, label=dev.label or dev.guess, reason=reason)
+                dash = collect_state(cfg, iface, network=False)
+                ui_status.flash(msg if ok else f"block failed: {msg}")
+            if ch in (ord("x"), ord("X")):
+                num = prompt_line(stdscr, h - 3, "▸ row # to unblock: ", w)
+                if not num.isdigit():
+                    ui_status.flash("invalid row number")
+                    continue
+                idx = int(num) - 1
+                if idx < 0 or idx >= len(dash.devices):
+                    ui_status.flash("row out of range")
+                    continue
+                dev = dash.devices[idx]
+                ok, msg = unblock_device(cfg, dev.mac)
+                dash = collect_state(cfg, iface, network=False)
+                ui_status.flash(msg if ok else f"unblock failed: {msg}")
+    finally:
+        stdscr.timeout(IDLE_TIMEOUT_MS)
+
+
+def show_host_exposure(stdscr, cfg: dict[str, Any], iface: str) -> str:
+    cyber_screen_enter(stdscr, "HOST")
+    cfg = load_config()
+    ok, msg = gate_capability(stdscr, cfg, check_host_exposure_gap(cfg))
+    if not ok:
+        cyber_screen_exit(stdscr)
+        return msg if msg != "cancelled" else ""
+    ttl = status_flash_seconds(cfg)
+    legend = "T trust · d port dig · r refresh · q back"
+    ui_status = FlashStatus(legend, ttl=ttl)
+    stdscr.timeout(IDLE_TIMEOUT_MS)
+    try:
+        while True:
+            cfg = load_config()
+            dash = collect_state(cfg, iface, network=False)
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            footer = ui_status.current()
+            draw_cyber_hud_bar(stdscr, 0, w, " HOST EXPOSURE // sessions reaching THIS node ", footer, pair=CP_ALERT)
+            row = 2
+            half = max(24, (w - 3) // 2)
+
+            draw_cyber_panel(stdscr, row, 0, h - row - 2, half, "INBOUND :: remote → you", pair=CP_ALERT)
+            lines: list[str] = []
+            attrs: list[int] = []
+            for f in dash.inbound:
+                tag = "▸UNTRUSTED" if f.is_new else "trusted"
+                lines.append(f"{f.remote_ip:<16} → {f.service:<8} {f.proc or '?'}")
+                lines.append(f"  {f.name[:28]}  {tag}")
+                attrs.extend([cp(CP_ALERT, bold=True) if f.is_new else cp(CP_GREEN), cp(CP_WHITE, dim=True)])
+            if not lines:
+                lines = ["(no remote sessions to listening ports)"]
+            put_lines(stdscr, row + 1, 2, half - 4, lines, cp(CP_WHITE, dim=True), line_attrs=attrs or None)
+
+            draw_cyber_panel(stdscr, row, half + 1, h - row - 2, w - half - 2, "PATHS :: bridges/tunnels", pair=CP_MAGENTA)
+            path_lines: list[str] = []
+            for b in dash.bridges:
+                path_lines.append(f"◈ {b.name} ({b.state})")
+                path_lines.append(f"  {b.note[: half - 6]}")
+            if dash.login_sessions:
+                path_lines.append("── logins (who) ──")
+                path_lines.extend(dash.login_sessions)
+            if dash.exposed:
+                path_lines.append("── LAN listeners ──")
+                for e in dash.exposed:
+                    mark = "!" if e.risk == "alert" else "·"
+                    label = format_listener_label(e)
+                    extra = f" {e.proto}" if e.proto else ""
+                    path_lines.append(f"{mark} :{e.port}{extra} {label}")
+                path_lines.append("  d + port# to dig (e.g. d11434)")
+            put_lines(
+                stdscr,
+                row + 1,
+                half + 3,
+                w - half - 5,
+                path_lines or ["(no bridges/tunnels detected)"],
+                cp(CP_MAGENTA, dim=True),
+            )
+
+            draw_cyber_footer(stdscr, h - 1, w, footer)
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            if ch in (ord("q"), ord("Q"), 27):
+                cyber_screen_exit(stdscr)
+                return ""
+            if ch in (ord("t"), ord("T")):
+                n = trust_inbound_ips(cfg, dash.new_inbound or [f.remote_ip for f in dash.inbound if f.is_new])
+                ui_status.flash(f"trusted {n} inbound peer(s)" if n else "no new peers to trust")
+            if ch in (ord("r"), ord("R")):
+                dash = collect_state(cfg, iface, network=False)
+                ui_status.flash(f"refresh {time.strftime('%H:%M:%S')}")
+            if ch in (ord("d"), ord("D")):
+                port = prompt_line(stdscr, h - 3, "▸ port to dig (e.g. 11434): ", w)
+                if port.isdigit():
+                    info = dig_listener(port)
+                    ui_status.flash(
+                        f":{port} → {info['process']}"
+                        + (f" pid {info['pid']}" if info["pid"] else "")
+                        + (f" [{info['proto']}]" if info["proto"] else "")
+                    )
+                else:
+                    ui_status.flash("invalid port")
+    finally:
+        stdscr.timeout(IDLE_TIMEOUT_MS)
+
+
+def show_help(stdscr, cfg: dict[str, Any]) -> None:
+    cyber_screen_enter(stdscr, "HELP")
+    lines = help_lines(cfg)
+    offset = 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        draw_cyber_hud_bar(
+            stdscr,
+            0,
+            w,
+            " NETWATCH // DATASHEET // NEURAL OPS MANUAL ",
+            "▸ q·close ",
+            pair=CP_CYAN,
+        )
+        safe_addstr(stdscr, 1, 0, ("═" * max(0, w - 1))[: w - 1], cp(CP_CYAN, dim=True))
+        visible = h - 3
+        for i in range(visible):
+            idx = offset + i
+            if idx >= len(lines):
+                break
+            safe_addstr(stdscr, i + 2, 2, lines[idx], help_line_attr(lines[idx]), w - 3)
+        scroll_hint = (
+            f" ◈ scroll ↑↓/jk  "
+            f"{offset + 1}-{min(offset + visible, len(lines))}/{len(lines)}  "
+            f"space/enter/q·exit "
+        )
+        safe_addstr(stdscr, h - 1, 0, scroll_hint[: w - 1], cp(CP_YELLOW, dim=True))
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord("q"), ord("Q"), 27, 10, 13, ord(" ")):
+            cyber_screen_exit(stdscr)
+            break
+        if ch in (curses.KEY_UP, ord("k")) and offset > 0:
+            offset -= 1
+        if ch in (curses.KEY_DOWN, ord("j")) and offset + visible < len(lines):
+            offset += 1
+
+
+def _lan_line_attr(device: LanDevice, scanned: bool) -> int:
+    if device.is_new:
+        return cp(CP_ALERT, bold=True)
+    if device.label:
+        return cp(CP_GREEN)
+    if scanned:
+        return cp(CP_CYAN)
+    return cp(CP_WHITE, dim=True)
+
+
+def render(
+    stdscr,
+    cfg,
+    dash,
+    status,
+    scanned,
+    frame: int = 0,
+    panel_page: int = 0,
+) -> None:
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    _, gateway, local = default_route()
+    pulse = cyber_pulse(frame)
+    clock = time.strftime("%H:%M:%S")
+    per_page = panels_per_page(cfg)
+    all_panels = build_dashboard_panels(cfg, dash, scanned)
+    pages = panel_page_count(len(all_panels), cfg)
+    panel_page = panel_page % pages
+    visible = all_panels[panel_page * per_page : (panel_page + 1) * per_page]
+    page_label = f"panels {panel_page * per_page + 1}-{panel_page * per_page + len(visible)}/{len(all_panels)}"
+
+    left = (
+        f" NETWATCH // CYBERNETIC UPLINK  {pulse}  "
+        f"node·{local or '?'}  gw·{gateway or '?'}  {clock} "
+    )
+    draw_cyber_hud_bar(
+        stdscr,
+        0,
+        w,
+        left,
+        f"◈ {page_label} · {binding_label(cfg, 'panel_next')}/{binding_label(cfg, 'panel_prev')} ◈",
+        pair=CP_MAGENTA,
+    )
+    row = 1
+    safe_addstr(stdscr, row, 0, ("═" * max(0, w - 1))[: w - 1], cp(CP_CYAN, dim=True))
+    row += 1
+
+    if cfg["alerts"].get("banner") and dash.new_macs:
+        alert = (
+            f" ⚠ UNKNOWN: {len(dash.new_macs)} device(s) — "
+            f"{binding_label(cfg, 'block')}·block  "
+            f"{binding_label(cfg, 'identify')}·identify  "
+            f"{binding_label(cfg, 'acknowledge')}·trust "
+        )
+        safe_addstr(stdscr, row, 0, alert[: w - 1], cp(CP_ALERT, bold=True), w)
+        row += 1
+        safe_addstr(stdscr, row, 0, ("─" * max(0, w - 1))[: w - 1], cp(CP_ALERT, dim=True))
+        row += 1
+
+    he = cfg.get("host_exposure", {})
+    if he.get("enabled", True) and he.get("banner", True) and dash.new_inbound:
+        alert = (
+            f" ⚠ HOST EXPOSURE: {len(dash.new_inbound)} remote peer(s) on THIS PC "
+            f"— {binding_label(cfg, 'host_exposure')}·detail  "
+            f"{binding_label(cfg, 'trust_inbound')}·trust "
+        )
+        safe_addstr(stdscr, row, 0, alert[: w - 1], cp(CP_ALERT, bold=True), w)
+        row += 1
+        safe_addstr(stdscr, row, 0, ("─" * max(0, w - 1))[: w - 1], cp(CP_ALERT, dim=True))
+        row += 1
+
+    body_h = max(8, h - row - 2)
+    cols, rows = 2, 2
+    gap_x, gap_y = 1, 1
+    cell_w = max(20, (w - gap_x) // cols)
+    cell_h = max(6, (body_h - gap_y) // rows)
+
+    for idx in range(per_page):
+        if idx >= len(visible):
+            break
+        panel = visible[idx]
+        pr, pc = idx // cols, idx % cols
+        py = row + pr * (cell_h + gap_y)
+        px = pc * (cell_w + gap_x)
+        pw = cell_w if pc == 0 else min(cell_w, w - px - 1)
+        extra = f" ({panel.total})" if panel.total > items_per_panel(cfg) else ""
+        title = f"{panel.title}{extra}"
+        draw_cyber_panel(stdscr, py, px, cell_h, pw, title, pair=panel.pair)
+        put_lines(
+            stdscr,
+            py + 1,
+            px + 2,
+            pw - 4,
+            panel.lines,
+            cp(CP_WHITE, dim=True),
+            line_attrs=panel.line_attrs,
+        )
+
+    draw_cyber_footer(stdscr, h - 1, w, status, cfg)
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    init_cyber_theme()
+    stdscr.timeout(IDLE_TIMEOUT_MS)
+
+    iface, _, local = default_route()
+    cfg = load_config()
+    ensure_oui_cache(cfg)
+    scanned = False
+    ui_status = FlashStatus(dashboard_status_legend(cfg), ttl=status_flash_seconds(cfg))
+    ui_frame = 0
+    panel_page = 0
+    cyber_screen_enter(stdscr, "BOOT")
+    dash = run_with_cyber_loader(stdscr, "SYNC", collect_state, cfg, iface)
+    last_refresh = time.time()
+    auto = int(cfg.get("display", {}).get("refresh_seconds") or 0)
+
+    while True:
+        render(stdscr, cfg, dash, ui_status.current(), scanned, ui_frame, panel_page=panel_page)
+        ui_frame += 1
+        if auto and time.time() - last_refresh >= auto:
+            cfg = load_config()
+            ui_status.legend = dashboard_status_legend(cfg)
+            ui_status.ttl = status_flash_seconds(cfg)
+            dash = collect_state(cfg, iface)
+            ui_status.flash(f"auto {time.strftime('%H:%M:%S')}")
+            last_refresh = time.time()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        if ch == 27 or key_matches_action(cfg, ch, "quit"):
+            break
+        if key_matches_action(cfg, ch, "refresh"):
+            cfg = load_config()
+            ui_status.legend = dashboard_status_legend(cfg)
+            ui_status.ttl = status_flash_seconds(cfg)
+            auto = int(cfg.get("display", {}).get("refresh_seconds") or 0)
+            dash = collect_state(cfg, iface)
+            ui_status.flash(f"refresh {time.strftime('%H:%M:%S')}")
+            last_refresh = time.time()
+        elif key_matches_action(cfg, ch, "panel_next"):
+            panels = build_dashboard_panels(cfg, dash, scanned)
+            panel_page = advance_panel_page(panel_page, len(panels), cfg)
+            ui_status.flash(f"panel page {panel_page + 1}/{panel_page_count(len(panels), cfg)}")
+        elif key_matches_action(cfg, ch, "panel_prev"):
+            panels = build_dashboard_panels(cfg, dash, scanned)
+            panel_page = retreat_panel_page(panel_page, len(panels), cfg)
+            ui_status.flash(f"panel page {panel_page + 1}/{panel_page_count(len(panels), cfg)}")
+        elif key_matches_action(cfg, ch, "options"):
+            msg = show_options(stdscr, cfg)
+            cfg = load_config()
+            ui_status.legend = dashboard_status_legend(cfg)
+            ui_status.ttl = status_flash_seconds(cfg)
+            auto = int(cfg.get("display", {}).get("refresh_seconds") or 0)
+            dash = collect_state(cfg, iface, network=False)
+            if msg:
+                ui_status.flash(msg, ttl=max(ui_status.ttl, 5.0))
+        elif key_matches_action(cfg, ch, "block"):
+            unknown = unknown_devices(dash.devices, cfg)
+            if unknown:
+                ok, gate_msg = gate_capability(stdscr, cfg, check_countermeasures_gap(cfg))
+                if not ok:
+                    ui_status.flash(gate_msg if gate_msg != "cancelled" else "block cancelled")
+                    continue
+                if gate_msg:
+                    ui_status.flash(gate_msg)
+                msg = quick_block_unknown(stdscr, cfg, dash.devices)
+                dash = collect_state(cfg, iface, network=False)
+                ui_status.flash(msg)
+            else:
+                ui_status.flash("no unknown devices — use G for registry")
+        elif key_matches_action(cfg, ch, "registry"):
+            msg = show_quarantine_registry(stdscr, cfg, iface)
+            dash = collect_state(cfg, iface, network=False)
+            if msg:
+                ui_status.flash(msg)
+        elif key_matches_action(cfg, ch, "acknowledge"):
+            dash = collect_state(cfg, iface, acknowledge=True)
+            ui_status.flash("acknowledged current MACs")
+        elif key_matches_action(cfg, ch, "trust_inbound"):
+            n = trust_inbound_ips(cfg, dash.new_inbound)
+            dash = collect_state(cfg, iface, network=False)
+            ui_status.flash(f"trusted {n} inbound peer(s)" if n else "no new inbound peers")
+        elif key_matches_action(cfg, ch, "host_exposure"):
+            msg = show_host_exposure(stdscr, cfg, iface)
+            dash = collect_state(cfg, iface, network=False)
+            if msg:
+                ui_status.flash(msg)
+        elif key_matches_action(cfg, ch, "identify"):
+            msg = show_identify(stdscr, cfg, iface)
+            dash = collect_state(cfg, iface, network=False)
+            if msg:
+                ui_status.flash(msg)
+        elif key_matches_action(cfg, ch, "scan"):
+            if not iface or not local:
+                ui_status.flash("scan failed: no interface")
+                continue
+            ok, gate_msg = gate_capability(stdscr, cfg, check_house_scan_gap(cfg))
+            if not ok:
+                ui_status.flash(gate_msg if gate_msg != "cancelled" else "scan cancelled")
+                continue
+            if gate_msg:
+                ui_status.flash(gate_msg)
+
+            def do_scan() -> tuple[DashboardState, str]:
+                _, summary = house_scan(cfg, iface, local)
+                time.sleep(0.3)
+                return collect_state(cfg, iface, force_identify=True), summary
+
+            dash, scan_summary = run_with_cyber_loader(stdscr, "HOUSE", do_scan)
+            scanned = True
+            ui_status.flash(scan_summary)
+        elif key_matches_action(cfg, ch, "help"):
+            show_help(stdscr, cfg)
+
+
+def ensure_runtime_data_files() -> None:
+    """Create empty local state files — never seed personal LAN data."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not BLOCKED_PATH.is_file():
+        BLOCKED_PATH.write_text("{}\n")
+    if not TRUSTED_PEERS_PATH.is_file():
+        TRUSTED_PEERS_PATH.write_text("{}\n")
+    if not MANUAL_PATH.is_file():
+        MANUAL_PATH.write_text("[]\n")
+    known_default = expand_path(DEFAULT_CONFIG["alerts"]["state_file"])
+    if not known_default.is_file():
+        known_default.write_text("{}\n")
+    if not ALERT_STATE_PATH.is_file():
+        ALERT_STATE_PATH.write_text('{"notified_macs": {}}\n')
+    secrets_example = CONFIG_DIR / "secrets.env.example"
+    if not secrets_example.is_file():
+        secrets_example.write_text(
+            "# Copy to secrets.env (chmod 600). Never commit secrets.env.\n"
+            "ROUTER_USER=\n"
+            "ROUTER_PASSWORD=\n"
+            "NETWATCH_SMTP_USER=\n"
+            "NETWATCH_SMTP_PASS=\n"
+        )
+
+
+if __name__ == "__main__":
+    if not shutil.which("ip"):
+        raise SystemExit("Requires 'ip' from iproute.")
+    if yaml is None:
+        raise SystemExit("Requires PyYAML (dnf install python3-pyyaml)")
+    ensure_runtime_data_files()
+    if not CONFIG_PATH.is_file():
+        CONFIG_PATH.write_text(
+            "# Generated defaults\n" + yaml.dump(DEFAULT_CONFIG, default_flow_style=False, sort_keys=False)
+        )
+
+    args = sys.argv[1:]
+    if args and args[0] in ("--check", "-c", "check"):
+        raise SystemExit(cli_check())
+    if args and args[0] in ("--configure", "configure"):
+        raise SystemExit(cli_configure())
+    if args and args[0] in ("--setup", "setup"):
+        raise SystemExit(cli_setup())
+    if args and args[0] in ("--restore-blocks", "restore-blocks"):
+        raise SystemExit(cli_restore_blocks())
+    if args and args[0] in ("--version", "-V"):
+        print(f"netwatch {__version__}")
+        raise SystemExit(0)
+    if args and args[0] in ("--help", "-h"):
+        print(f"Netwatch v{__version__} — home LAN / host exposure TUI")
+        print("")
+        print("Usage: netwatch                 Interactive dashboard")
+        print("       netwatch --configure     Router username/password (+ optional SMTP)")
+        print("       netwatch --setup         Credentials + sudo quarantine (run once)")
+        print("       netwatch --check         Scan + alert (cron-friendly)")
+        print("       netwatch --restore-blocks  Re-apply quarantine after reboot")
+        print("       netwatch --dig-listeners LAN listeners with process names")
+        print("       netwatch --dig-port PORT Deep lookup (e.g. --dig-port 11434)")
+        raise SystemExit(0)
+    if args and args[0] in ("--dig-listeners", "dig-listeners"):
+        raise SystemExit(cli_dig_listeners())
+    if args and args[0] in ("--dig-port", "dig-port") and len(args) > 1:
+        raise SystemExit(cli_dig_listeners(port=args[1]))
+
+    curses.wrapper(main)

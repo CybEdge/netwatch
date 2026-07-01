@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Never commit local secrets or runtime LAN state
+secrets.env
+*.env
+!share/secrets.env.example
+
+# If someone runs netwatch from the clone directory
+known_devices.json
+router-manual.json
+blocked_devices.json
+trusted_peers.json
+alert_state.json
+.enforcement-ready
+check.log
+*.log
+oui.txt

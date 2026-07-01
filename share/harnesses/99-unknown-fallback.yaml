@@ -1,0 +1,10 @@
+id: unknown-fallback
+name: Unknown device
+priority: 1
+enabled: true
+probe:
+  type: static
+result:
+  device_type: unknown
+  auto_guess: unknown device
+  note: no harness matched

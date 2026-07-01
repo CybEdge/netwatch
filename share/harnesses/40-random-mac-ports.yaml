@@ -1,0 +1,28 @@
+# Privacy/random MAC devices — port fingerprinting
+id: random-mac-ports
+name: Random MAC port map
+priority: 40
+enabled: true
+when:
+  random_mac: true
+  hostname_empty: true
+probe:
+  type: tcp_map
+  timeout: 0.35
+  ports:
+    "62078":
+      device_type: apple?
+      auto_guess: Apple phone/tablet?
+      note: iOS companion port 62078
+    "7000":
+      device_type: apple?
+      auto_guess: Apple AirPlay device?
+      note: AirPlay port 7000
+    "8008":
+      device_type: cast?
+      auto_guess: Chromecast / Google Cast?
+      note: Google Cast port 8008
+  default:
+    device_type: mobile?
+    auto_guess: phone/tablet? (random MAC, no name)
+    note: random MAC, no matching probe ports

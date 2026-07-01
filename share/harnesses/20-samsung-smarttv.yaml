@@ -1,0 +1,20 @@
+# Samsung Tizen Smart TV — REST API on port 8001
+id: samsung-smarttv
+name: Samsung Smart TV API
+priority: 90
+enabled: true
+when:
+  port_open: 8001
+probe:
+  type: http_json
+  url: "http://{ip}:8001/api/v2/"
+  timeout: 1.5
+match:
+  - path: device.type
+    equals: Samsung SmartTV
+result:
+  device_type: samsung-tv
+  auto_guess: 'Samsung {name}'
+  note: "Tizen TV, {device.modelName}, {device.resolution}"
+  transform:
+    auto_guess: html_unescape

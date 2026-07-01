@@ -1,0 +1,120 @@
+# Netwatch configuration example — copied to ~/.config/netwatch/config.yaml by install.sh
+# Edit there or press O in the dashboard. Press R to reload.
+
+alerts:
+  enabled: true
+  # MACs seen before are stored here (auto-created):
+  state_file: ~/.config/netwatch/known_devices.json
+  # Show a banner when an unknown MAC appears on LAN:
+  banner: true
+
+tailscale:
+  enabled: true
+  # Uses `tailscale status --json` (Tailscale must be installed + logged in)
+
+router:
+  enabled: true
+  # Router admin URL — leave empty to auto-detect from default gateway:
+  url: ""
+  # Integration type:
+  #   disabled — skip router panel
+  #   custom   — run custom_script (recommended for ISP gateways)
+  #   fritzbox — AVM Fritz!Box TR-064 (needs credentials)
+  type: custom
+  # Fritz!Box only — password read from env var (do NOT store secrets here):
+  fritzbox:
+    host: ""
+    username: admin
+    password_env: FRITZBOX_PASSWORD
+  # Custom script must print JSON array to stdout, e.g.:
+  # [{"ip":"198.51.100.10","mac":"aa:bb:cc:dd:ee:ff","name":"Example device"}]
+  custom_script: ~/.config/netwatch/router-clients.sh
+
+scan:
+  # Subnet for house scan (s key). Leave empty to auto-detect /24 from your IP.
+  cidr: ""
+  # Add other subnets if a repeater/mesh uses a different range (rare on same SSID):
+  extra_cidrs: []
+  # 0 = ping all hosts in cidr (.1-.254). Was 64 — too small for whole house.
+  ping_limit: 0
+  ping_workers: 48
+  methods:
+    - ping
+    - mdns
+  mdns_timeout_seconds: 4
+  # Runs nmap -sn automatically when nmap is installed (optional, faster on big LANs):
+  use_nmap_if_available: true
+
+display:
+  refresh_seconds: 0
+  panels_per_page: 4
+  items_per_panel: 15
+  status_flash_seconds: 3.0
+
+identify:
+  auto_enrich: true
+  auto_probe_unknown: true
+  # Re-probe unnamed devices after this many seconds:
+  probe_interval_seconds: 300
+  resolve_timeout_seconds: 1
+  oui_cache: ~/.config/netwatch/oui.txt
+  oui_url: https://www.wireshark.org/download/automated/data/manuf
+
+harnesses:
+  enabled: true
+  directory: ~/.config/netwatch/harnesses
+  # Stop after first matching harness (by priority). false = pick highest confidence.
+  stop_on_first_match: true
+
+notifications:
+  enabled: true
+  # Re-alert for the same unknown MAC after this many hours:
+  repeat_hours: 24
+  desktop:
+    enabled: true
+  email:
+    enabled: false
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+    use_tls: true
+    username_env: NETWATCH_SMTP_USER
+    password_env: NETWATCH_SMTP_PASS
+    from: netwatch@home.lan
+    to: ""   # your email address
+
+countermeasures:
+  enabled: true
+  block_file: ~/.config/netwatch/blocked_devices.json
+  # Quarantine ONLY when you press b in identify — never from cron or alerts.
+  auto_quarantine: false
+  # Set true to re-apply your blocks after reboot (systemd). Default: off.
+  restore_on_boot: true
+  block_by_mac: true
+  method: full
+  block_script: ~/.config/netwatch/router-block.sh
+  protect_gateway: true
+  protect_self: true
+  sudo_non_interactive: true
+  auto_setup: false
+  router_block:
+    enabled: true
+    type: zte
+    host: ""
+    username_env: ROUTER_USER
+    password_env: ROUTER_PASSWORD
+    mac_filter_view: wlanMacFilter
+    mac_filter_data: wlan_macfilter_lua.lua
+
+# Who can reach THIS computer (SSH, tunnels, bridges) — not just LAN neighbors
+host_exposure:
+  enabled: true
+  monitor_inbound: true
+  monitor_bridges: true
+  monitor_listeners: true
+  trusted_peers_file: ~/.config/netwatch/trusted_peers.json
+  # Ports you intentionally expose on LAN/0.0.0.0 (won't flag as risky)
+  trusted_ports: []
+  trusted_ips: []
+  banner: true
+  alert_inbound: true
+  resolve_with_sudo: true

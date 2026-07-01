@@ -1,0 +1,18 @@
+id: hostname-android
+name: Android hostname
+priority: 79
+enabled: true
+when:
+  hostname_contains_any:
+    - android
+    - galaxy
+    - pixel
+    - oneplus
+    - xiaomi
+    - samsung
+probe:
+  type: hostname_map
+result:
+  device_type: android
+  auto_guess: "{hostname_short}"
+  note: "{hostname}"

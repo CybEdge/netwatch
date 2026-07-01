@@ -1,0 +1,13 @@
+# Allow netwatch to apply nftables quarantine without a password prompt.
+# Install: sudo cp ~/.config/netwatch/sudoers-netwatch.example /etc/sudoers.d/netwatch
+#          sudo chmod 440 /etc/sudoers.d/netwatch
+#          sudo visudo -cf /etc/sudoers.d/netwatch
+#
+# Replace YOUR_USER with your login name.
+
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/nft add table inet netwatch
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/nft add chain inet netwatch *
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/nft add rule inet netwatch *
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/nft flush chain inet netwatch *
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/nft delete table inet netwatch
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/nft list table inet netwatch

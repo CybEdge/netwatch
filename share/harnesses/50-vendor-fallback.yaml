@@ -1,0 +1,23 @@
+id: vendor-fallback
+name: MAC vendor guess
+priority: 20
+enabled: true
+when:
+  vendor_present: true
+  random_mac: false
+probe:
+  type: vendor_map
+  rules:
+    - contains: apple
+      device_type: apple
+      auto_guess: Apple device
+    - contains: samsung
+      device_type: samsung?
+      auto_guess: "{vendor} device?"
+    - contains: google
+      device_type: google?
+      auto_guess: "{vendor} device?"
+  default:
+    device_type: vendor
+    auto_guess: "{vendor}"
+    note: "{vendor}"
