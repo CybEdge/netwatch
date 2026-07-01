@@ -52,7 +52,7 @@ Disable local login in `config.yaml`: `auth.enabled: false`
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR_USER/netwatch.git
+git clone https://github.com/CybEdge/netwatch.git
 cd netwatch
 ./install.sh
 
@@ -114,6 +114,12 @@ cp ~/.config/netwatch/router-manual.json.example ~/.config/netwatch/router-manua
 - Do not commit `secrets.env`, `known_devices.json`, or `router-manual.json`.
 - Review `share/sudoers-netwatch.example` before `--setup`.
 
+## Contributing
+
+`main` is intended to stay review-only. Please **fork**, work on a **branch**, and open a **pull request** — do not push directly to `main`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow. Maintainers: run `./scripts/enable-main-protection.sh` once (after `gh auth login`) to enforce this on GitHub.
+
 ## Project layout
 
 ```
@@ -126,6 +132,9 @@ netwatch/
 │   ├── harnesses/        # Default probe harnesses
 │   ├── router-clients.sh
 │   └── ...
+├── CONTRIBUTING.md
+├── scripts/
+│   └── enable-main-protection.sh
 ├── README.md
 └── LICENSE
 ```
