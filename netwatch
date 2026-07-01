@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import smtplib
 import socket
@@ -45,6 +46,7 @@ BLOCKED_PATH = CONFIG_DIR / "blocked_devices.json"
 ALERT_STATE_PATH = CONFIG_DIR / "alert_state.json"
 TRUSTED_PEERS_PATH = CONFIG_DIR / "trusted_peers.json"
 SECRETS_PATH = CONFIG_DIR / "secrets.env"
+AUTH_PATH = CONFIG_DIR / "auth.json"
 SETUP_MARKER = CONFIG_DIR / ".enforcement-ready"
 SYSTEMD_USER_UNIT = Path.home() / ".config/systemd/user/netwatch-blocks.service"
 HARNESS_DIR = CONFIG_DIR / "harnesses"
@@ -104,6 +106,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "keybindings": {},
     "prompts": {
         "dismissed": {},
+    },
+    "auth": {
+        "enabled": True,
     },
     "notifications": {
         "enabled": True,
@@ -398,13 +403,14 @@ def help_lines(cfg: dict[str, Any]) -> list[str]:
         "",
         "── Config files ──",
         f"  config.yaml:       {CONFIG_PATH}",
+        f"  local login:       {AUTH_PATH} (hashed; no recovery — use --new-user to start over)",
         f"  known_devices:     {cfg['alerts']['state_file']}",
         f"  router-manual:     {MANUAL_PATH}",
         f"  vendor database:   {cfg['identify']['oui_cache']}",
         f"  probe harnesses:   {cfg['harnesses']['directory']}",
         "",
         "── Alerts ──",
-        "  Unknown MAC → red banner. Verify in identify mode, then press a.",
+        "  Unknown MAC → red banner until you label (l), trust (a), or block (b).",
         "",
         "── Countermeasures ──",
         "  netwatch --configure   router username/password (secrets.env, chmod 600)",
@@ -1113,47 +1119,39 @@ def enrich_devices(
         known[dev.mac] = entry
 
 
+def device_needs_attention(
+    dev: LanDevice, known: dict[str, dict], cfg: dict[str, Any]
+) -> bool:
+    """Stay flagged until the user labels, acknowledges, or blocks the device."""
+    if is_blocked_mac(cfg, dev.mac):
+        return False
+    entry = known.get(dev.mac) or {}
+    if entry.get("acknowledged"):
+        return False
+    label = (dev.label or entry.get("label") or "").strip()
+    return not label
+
+
 def update_known(
     known: dict[str, dict], devices: list[LanDevice], acknowledge: bool
-) -> tuple[list[str], dict[str, dict]]:
+) -> dict[str, dict]:
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
-    new_macs: list[str] = []
     for dev in devices:
         entry = known.get(dev.mac, {})
         if not entry:
-            new_macs.append(dev.mac)
-            if acknowledge:
-                known[dev.mac] = {
-                    "first_seen": now,
-                    "last_seen": now,
-                    "last_ip": dev.ip,
-                    "label": dev.label,
-                    "hostname": dev.hostname,
-                    "vendor": dev.vendor,
-                }
-        else:
-            entry["last_seen"] = now
-            entry["last_ip"] = dev.ip
-            if dev.label:
-                entry["label"] = dev.label
-            if dev.hostname:
-                entry["hostname"] = dev.hostname
-            if dev.vendor:
-                entry["vendor"] = dev.vendor
-            known[dev.mac] = entry
-    if acknowledge:
-        for dev in devices:
-            if dev.mac not in known:
-                known[dev.mac] = {
-                    "first_seen": now,
-                    "last_seen": now,
-                    "last_ip": dev.ip,
-                    "label": dev.label,
-                    "hostname": dev.hostname,
-                    "vendor": dev.vendor,
-                }
-        new_macs = []
-    return new_macs, known
+            entry = {"first_seen": now, "acknowledged": False}
+        entry["last_seen"] = now
+        entry["last_ip"] = dev.ip
+        if dev.label:
+            entry["label"] = dev.label
+        if dev.hostname:
+            entry["hostname"] = dev.hostname
+        if dev.vendor:
+            entry["vendor"] = dev.vendor
+        if acknowledge:
+            entry["acknowledged"] = True
+        known[dev.mac] = entry
+    return known
 
 
 def scan_cidrs(cfg: dict[str, Any], local_ip: str) -> list[str]:
@@ -2358,6 +2356,186 @@ def cli_configure() -> int:
     return configure_credentials()
 
 
+PBKDF2_ITERATIONS = 600_000
+
+
+def hash_password(password: str, *, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PBKDF2_ITERATIONS,
+    )
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iters_s, salt_hex, hash_hex = stored.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        iterations = int(iters_s)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+    except (TypeError, ValueError):
+        return False
+    computed = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return secrets.compare_digest(computed, expected)
+
+
+def load_auth_record() -> dict[str, Any] | None:
+    if not AUTH_PATH.is_file():
+        return None
+    try:
+        data = json.loads(AUTH_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict) or not data.get("username") or not data.get("password_hash"):
+        return None
+    return data
+
+
+def save_auth_record(username: str, password: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "username": username.strip(),
+        "password_hash": hash_password(password),
+        "version": 1,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    AUTH_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+    os.chmod(AUTH_PATH, 0o600)
+
+
+def local_auth_enabled(cfg: dict[str, Any] | None = None) -> bool:
+    cfg = cfg or load_config()
+    return bool(cfg.get("auth", {}).get("enabled", True))
+
+
+def setup_local_auth(*, warn_recovery: bool = True) -> None:
+    print("Netwatch // create your local login")
+    print("This protects the dashboard on this PC (not your router admin password).")
+    print(f"Credentials stored hashed in {AUTH_PATH}")
+    if warn_recovery:
+        print(
+            "\n⚠ There is NO password recovery. If you forget your login, it is lost forever."
+        )
+        print("  Your only option is  netwatch --new-user  — which erases all local data.\n")
+    username = ""
+    while not username.strip():
+        username = input("Choose username: ").strip()
+        if not username:
+            print("Username cannot be empty.\n")
+    while True:
+        password = getpass.getpass("Choose password: ")
+        if len(password) < 8:
+            print("Use at least 8 characters.\n")
+            continue
+        confirm = getpass.getpass("Confirm password: ")
+        if password != confirm:
+            print("Passwords do not match — try again.\n")
+            continue
+        break
+    save_auth_record(username, password)
+    print(f"\n✓ Local login created for '{username}'.")
+    print("  Password stored as a one-way hash — it cannot be read back or reset.")
+
+
+def wipe_local_user_data(cfg: dict[str, Any] | None = None) -> list[str]:
+    """Erase all netwatch data tied to the previous local user."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    wiped: list[str] = []
+    cfg = cfg or load_config()
+
+    paths_empty: list[tuple[Path, str]] = [
+        (AUTH_PATH, ""),
+        (BLOCKED_PATH, "{}\n"),
+        (TRUSTED_PEERS_PATH, "{}\n"),
+        (MANUAL_PATH, "[]\n"),
+        (ALERT_STATE_PATH, '{"notified_macs": {}}\n'),
+        (expand_path(cfg["alerts"]["state_file"]), "{}\n"),
+        (
+            SECRETS_PATH,
+            "# Netwatch secrets — chmod 600, never commit\n\nROUTER_USER=\nROUTER_PASSWORD=\n",
+        ),
+    ]
+    for path, content in paths_empty:
+        if content:
+            path.write_text(content)
+            if path == SECRETS_PATH or path == AUTH_PATH:
+                os.chmod(path, 0o600)
+        else:
+            path.unlink(missing_ok=True)
+        wiped.append(str(path))
+
+    if cfg.get("prompts", {}).get("dismissed"):
+        cfg.setdefault("prompts", {})["dismissed"] = {}
+        save_config(cfg)
+        wiped.append("config.yaml (prompt dismissals)")
+
+    return wiped
+
+
+def require_local_auth(cfg: dict[str, Any] | None = None) -> None:
+    if not local_auth_enabled(cfg):
+        return
+    record = load_auth_record()
+    if not record:
+        setup_local_auth()
+        return
+    username = str(record["username"])
+    for attempt in range(1, 4):
+        entered_user = input(f"Username [{username}]: ").strip() or username
+        entered_pass = getpass.getpass("Password: ")
+        if secrets.compare_digest(entered_user, username) and verify_password(
+            entered_pass, str(record["password_hash"])
+        ):
+            return
+        remaining = 3 - attempt
+        if remaining:
+            print(f"Invalid login — {remaining} attempt(s) left.\n")
+    print(
+        "\nAuthentication failed. There is no password recovery — a forgotten login is lost forever."
+    )
+    print("To start over with a new user (all labels, blocks, secrets, and alerts erased):")
+    print("  netwatch --new-user")
+    raise SystemExit(1)
+
+
+def cli_new_user() -> int:
+    if not AUTH_PATH.is_file():
+        print("No local login yet — run netwatch to create one.")
+        return 1
+    print("Netwatch // new local user")
+    print(
+        "⚠ This does NOT recover your old password — that login is gone forever."
+    )
+    print("⚠ All local netwatch data on this PC will be erased:")
+    print("    device labels, block registry, router-manual names, secrets, alert history")
+    print("")
+    if not prompt_yes_no("Erase everything and create a new login?", default=False):
+        print("Cancelled — existing data kept.")
+        return 1
+    if not prompt_yes_no("Are you sure? This cannot be undone.", default=False):
+        print("Cancelled.")
+        return 1
+    cfg = load_config()
+    wiped = wipe_local_user_data(cfg)
+    print("\nErased:")
+    for path in wiped:
+        print(f"  · {path}")
+    print("")
+    setup_local_auth(warn_recovery=True)
+    print("\nRun netwatch --configure and netwatch --setup again if you need router block / sudo.")
+    return 0
+
+
 def sudoers_content(user: str) -> str:
     nft = shutil.which("nft") or "/usr/sbin/nft"
     fw = shutil.which("firewall-cmd") or "/usr/bin/firewall-cmd"
@@ -3268,7 +3446,7 @@ def run_security_check(cfg: dict[str, Any], *, scan: bool = True) -> dict[str, A
 
     unknown: list[LanDevice] = []
     for dev in devices:
-        if dev.mac not in known and not is_blocked_mac(cfg, dev.mac):
+        if device_needs_attention(dev, known, cfg):
             enrich_devices([dev], known, [], cfg, force_refresh=False, network=False)
             unknown.append(dev)
         if is_blocked_mac(cfg, dev.mac):
@@ -3520,12 +3698,9 @@ def collect_state(
     state.router_clients, state.router_note = router_clients(cfg)
 
     if cfg["alerts"].get("enabled", True):
-        new_macs, known = update_known(known, devices, acknowledge)
-        state.new_macs = new_macs
-        for dev in devices:
-            dev.is_new = dev.mac in new_macs
+        known = update_known(known, devices, acknowledge)
     else:
-        new_macs = []
+        pass
 
     enrich_devices(
         devices,
@@ -3537,6 +3712,13 @@ def collect_state(
     )
     save_known(known_path, known)
     state.devices = devices
+
+    if cfg["alerts"].get("enabled", True):
+        state.new_macs = [d.mac for d in devices if device_needs_attention(d, known, cfg)]
+        for dev in devices:
+            dev.is_new = dev.mac in state.new_macs
+    else:
+        state.new_macs = []
 
     if cfg["tailscale"].get("enabled", True):
         state.tailscale, ts_note = tailscale_peers()
@@ -4276,10 +4458,19 @@ def put_lines(
     return row
 
 
-def prompt_line(stdscr, y: int, text: str, w: int) -> str:
+def prompt_line(
+    stdscr,
+    y: int,
+    text: str,
+    w: int,
+    *,
+    restore_timeout_ms: int = IDLE_TIMEOUT_MS,
+) -> str:
+    """Read one line of input — blocks until Enter (immune to idle flash timeouts)."""
     curses.echo()
     curses.curs_set(1)
     try:
+        stdscr.timeout(-1)
         stdscr.move(y, 0)
         stdscr.clrtoeol()
         safe_addstr(stdscr, y, 0, text[: w - 1], cp(CP_YELLOW, bold=True), w)
@@ -4287,6 +4478,7 @@ def prompt_line(stdscr, y: int, text: str, w: int) -> str:
         raw = stdscr.getstr(y, len(text), w - len(text) - 1)
         return raw.decode("utf-8", errors="replace").strip()
     finally:
+        stdscr.timeout(restore_timeout_ms)
         curses.noecho()
         curses.curs_set(0)
 
@@ -4940,6 +5132,8 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] in ("--check", "-c", "check"):
         raise SystemExit(cli_check())
+    if args and args[0] in ("--new-user", "new-user", "--reset-auth", "reset-auth"):
+        raise SystemExit(cli_new_user())
     if args and args[0] in ("--configure", "configure"):
         raise SystemExit(cli_configure())
     if args and args[0] in ("--setup", "setup"):
@@ -4955,6 +5149,7 @@ if __name__ == "__main__":
         print("Usage: netwatch                 Interactive dashboard")
         print("       netwatch --configure     Router username/password (+ optional SMTP)")
         print("       netwatch --setup         Credentials + sudo quarantine (run once)")
+        print("       netwatch --new-user       Forgot login? New user (wipes all local data)")
         print("       netwatch --check         Scan + alert (cron-friendly)")
         print("       netwatch --restore-blocks  Re-apply quarantine after reboot")
         print("       netwatch --dig-listeners LAN listeners with process names")
@@ -4965,4 +5160,6 @@ if __name__ == "__main__":
     if args and args[0] in ("--dig-port", "dig-port") and len(args) > 1:
         raise SystemExit(cli_dig_listeners(port=args[1]))
 
+    cfg = load_config()
+    require_local_auth(cfg)
     curses.wrapper(main)

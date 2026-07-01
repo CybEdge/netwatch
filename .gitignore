@@ -13,6 +13,7 @@ venv/
 
 # Never commit local secrets or runtime LAN state
 secrets.env
+auth.json
 *.env
 !share/secrets.env.example
 

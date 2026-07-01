@@ -2,7 +2,14 @@
 
 Cyberpunk terminal dashboard for **your** home network — defensive monitoring, device identification, host exposure, and manual quarantine. Built for Linux (Fedora/Nobara, KDE Plasma friendly).
 
-No cloud. No auto-install of packages or sudo rules without your consent. Secrets stay in `~/.config/netwatch/secrets.env` (mode `600`), never in git.
+No cloud. No auto-install of packages or sudo rules without your consent. Secrets stay under `~/.config/netwatch/` only — **never in this git repo**:
+
+| File | In git? |
+|------|---------|
+| `auth.json` (hashed local login) | **No** — gitignored |
+| `secrets.env` (router/SMTP) | **No** — gitignored |
+| `known_devices.json`, `router-manual.json`, … | **No** — gitignored |
+| `share/*.example` | Yes — empty templates only |
 
 ## Features
 
@@ -22,6 +29,20 @@ No cloud. No auto-install of packages or sudo rules without your consent. Secret
 | `ip` (iproute) | `tailscale` CLI |
 | | `firewalld` or `nftables` (quarantine) |
 | | `notify-send` (desktop alerts from `--check`) |
+
+## Local login (first run)
+
+The first time you run `netwatch`, you choose a **local username and password** for the dashboard on this PC. The password is stored as a **PBKDF2-SHA256 hash** in `~/.config/netwatch/auth.json` (mode `600`) — never plaintext.
+
+**There is no password recovery.** If you forget your login, it is lost forever. Your only option is to create a new user, which **erases all local netwatch data** (labels, blocks, secrets, alert history):
+
+```bash
+netwatch --new-user   # double confirmation — destructive, no undo
+```
+
+Disable local login in `config.yaml`: `auth.enabled: false`
+
+**Router credentials** (for whole-house block) are separate — stored in `secrets.env` via `netwatch --configure` because the router API requires the real password. Those are also chmod `600` and git-ignored, but cannot be one-way hashed.
 
 ## Quick start
 
@@ -67,7 +88,8 @@ After `install.sh`, files live under `~/.config/netwatch/`:
 | File | Purpose |
 |------|---------|
 | `config.yaml` | Feature toggles, scan methods, keybindings |
-| `secrets.env` | **Router & SMTP credentials** (from `--configure`) |
+| `secrets.env` | Router & SMTP credentials (from `--configure`; must be usable by router API) |
+| `auth.json` | **Local dashboard login** (hashed password, first-run setup) |
 | `known_devices.json` | MAC labels & probe cache (runtime) |
 | `router-manual.json` | Extra device names for router panel |
 | `harnesses/` | YAML device probes (extend without code changes) |
