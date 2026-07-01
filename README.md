@@ -103,19 +103,6 @@ netwatch/
 └── LICENSE
 ```
 
-## Publishing to GitHub
-
-From this directory:
-
-```bash
-git init
-git add netwatch install.sh share README.md LICENSE .gitignore
-git commit -m "Initial release: netwatch home LAN TUI"
-gh repo create netwatch --public --source=. --push
-```
-
-Replace `YOUR_USER` in the clone URL above with your GitHub username.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
