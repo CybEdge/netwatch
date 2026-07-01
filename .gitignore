@@ -23,6 +23,7 @@ router-manual.json
 blocked_devices.json
 trusted_peers.json
 alert_state.json
+ui_state.json
 .enforcement-ready
 check.log
 *.log

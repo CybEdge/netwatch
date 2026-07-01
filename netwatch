@@ -47,6 +47,7 @@ ALERT_STATE_PATH = CONFIG_DIR / "alert_state.json"
 TRUSTED_PEERS_PATH = CONFIG_DIR / "trusted_peers.json"
 SECRETS_PATH = CONFIG_DIR / "secrets.env"
 AUTH_PATH = CONFIG_DIR / "auth.json"
+UI_STATE_PATH = CONFIG_DIR / "ui_state.json"
 SETUP_MARKER = CONFIG_DIR / ".enforcement-ready"
 SYSTEMD_USER_UNIT = Path.home() / ".config/systemd/user/netwatch-blocks.service"
 HARNESS_DIR = CONFIG_DIR / "harnesses"
@@ -102,6 +103,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "panels_per_page": 4,
         "items_per_panel": 15,
         "status_flash_seconds": 3.0,
+        "theme": "cyber",
+        "redact_level": "partial",
+        "remember_panel_page": True,
     },
     "keybindings": {},
     "prompts": {
@@ -110,9 +114,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auth": {
         "enabled": True,
     },
+    "snooze": {
+        "default_hours": 24,
+    },
     "notifications": {
         "enabled": True,
         "repeat_hours": 24,
+        "dedupe_same_ip": True,
         "desktop": {"enabled": True},
         "email": {
             "enabled": False,
@@ -239,6 +247,10 @@ DEFAULT_KEYBINDINGS: dict[str, tuple[str, str]] = {
     "panel_prev": ("Previous panel page", "w"),
     "identify": ("Identify / label devices", "i"),
     "trust": ("Trust devices & inbound peers", "t"),
+    "snooze": ("Snooze alerts (24h)", "z"),
+    "redact": ("Toggle redact mode", "v"),
+    "search": ("Search / filter panels", "/"),
+    "copy": ("Copy focus to clipboard", "c"),
     "block": ("Block unknown device (quarantine)", "b"),
     "registry": ("Blocked-device registry", "g"),
     "host_exposure": ("Host exposure detail view", "e"),
@@ -327,11 +339,35 @@ def dashboard_status_legend(cfg: dict[str, Any]) -> str:
     pp = binding_label(cfg, "panel_prev")
     return (
         f"{pn}/{pp} panels · "
+        f"{binding_label(cfg, 'search')}/{binding_label(cfg, 'copy')} find/copy · "
+        f"{binding_label(cfg, 'snooze')} snooze · "
+        f"{binding_label(cfg, 'redact')} redact · "
         f"{binding_label(cfg, 'options')} opts · "
         f"{binding_label(cfg, 'block')} block · "
         f"{binding_label(cfg, 'registry')} list · "
         f"{binding_label(cfg, 'refresh')} sync · "
         f"{binding_label(cfg, 'help')} help"
+    )
+
+
+def identify_status_legend(cfg: dict[str, Any]) -> str:
+    return (
+        f"n probe · l label · b block · x unblock · "
+        f"{binding_label(cfg, 'trust')} trust · "
+        f"{binding_label(cfg, 'snooze')} snooze · "
+        f"{binding_label(cfg, 'redact')} redact · "
+        f"{binding_label(cfg, 'search')}/{binding_label(cfg, 'copy')} find/copy · "
+        f"m import · r refresh · q back"
+    )
+
+
+def host_exposure_status_legend(cfg: dict[str, Any]) -> str:
+    return (
+        f"{binding_label(cfg, 'trust')} trust · "
+        f"{binding_label(cfg, 'snooze')} snooze · "
+        f"{binding_label(cfg, 'redact')} redact · "
+        f"{binding_label(cfg, 'search')}/{binding_label(cfg, 'copy')} find/copy · "
+        f"d port dig · r refresh · q back"
     )
 
 
@@ -415,6 +451,9 @@ def help_lines(cfg: dict[str, Any]) -> list[str]:
         "",
         "── Alerts ──",
         "  Unknown MAC → red banner until you label (l), trust (T), or block (b).",
+        f"  {binding_label(cfg, 'snooze')} snooze 24h without trusting · "
+        f"{binding_label(cfg, 'redact')} redact — V classified view; first use sets visibility guard",
+        f"  {binding_label(cfg, 'search')}/{binding_label(cfg, 'copy')} filter panels / copy row",
         "",
         "── Countermeasures ──",
         "  netwatch --configure   router username/password (secrets.env, chmod 600)",
@@ -449,6 +488,303 @@ def help_lines(cfg: dict[str, Any]) -> list[str]:
         "",
         "Press any key to return…",
     ]
+
+
+REDACT_CHAR = "█"
+CP_ALERT = 1
+CP_CYAN = 2
+CP_MAGENTA = 3
+CP_GREEN = 4
+CP_YELLOW = 5
+CP_BLUE = 6
+CP_WHITE = 7
+THEME_PALETTES: dict[str, dict[int, int]] = {
+    "cyber": {
+        CP_ALERT: curses.COLOR_RED,
+        CP_CYAN: curses.COLOR_CYAN,
+        CP_MAGENTA: curses.COLOR_MAGENTA,
+        CP_GREEN: curses.COLOR_GREEN,
+        CP_YELLOW: curses.COLOR_YELLOW,
+        CP_BLUE: curses.COLOR_BLUE,
+        CP_WHITE: curses.COLOR_WHITE,
+    },
+    "synthwave": {
+        CP_ALERT: curses.COLOR_MAGENTA,
+        CP_CYAN: curses.COLOR_MAGENTA,
+        CP_MAGENTA: curses.COLOR_CYAN,
+        CP_GREEN: curses.COLOR_GREEN,
+        CP_YELLOW: curses.COLOR_RED,
+        CP_BLUE: curses.COLOR_BLUE,
+        CP_WHITE: curses.COLOR_WHITE,
+    },
+    "amber": {
+        CP_ALERT: curses.COLOR_RED,
+        CP_CYAN: curses.COLOR_YELLOW,
+        CP_MAGENTA: curses.COLOR_YELLOW,
+        CP_GREEN: curses.COLOR_GREEN,
+        CP_YELLOW: curses.COLOR_YELLOW,
+        CP_BLUE: curses.COLOR_BLUE,
+        CP_WHITE: curses.COLOR_WHITE,
+    },
+}
+
+
+@dataclass
+class UiSession:
+    redact: bool = False
+    search_query: str = ""
+
+
+def load_ui_state(cfg: dict[str, Any]) -> dict[str, Any]:
+    if not UI_STATE_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(UI_STATE_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_ui_state(cfg: dict[str, Any], *, panel_page: int | None = None, redact: bool | None = None) -> None:
+    state = load_ui_state(cfg)
+    if panel_page is not None:
+        state["panel_page"] = max(0, int(panel_page))
+    if redact is not None:
+        state["redact"] = bool(redact)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    UI_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    try:
+        os.chmod(UI_STATE_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def load_redact_guard() -> dict[str, Any]:
+    raw = load_ui_state(load_config()).get("redact_guard")
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_redact_guard(guard: dict[str, Any]) -> None:
+    state = load_ui_state(load_config())
+    state["redact_guard"] = guard
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    UI_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    try:
+        os.chmod(UI_STATE_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def redact_guard_configured() -> bool:
+    return bool(load_redact_guard().get("configured"))
+
+
+def redact_guard_mode() -> str:
+    mode = str(load_redact_guard().get("mode") or "none").lower()
+    return mode if mode in ("none", "password", "pin") else "none"
+
+
+def verify_redact_unlock(secret: str, mode: str) -> bool:
+    secret = (secret or "").strip()
+    if not secret:
+        return False
+    if mode == "password":
+        record = load_auth_record()
+        if not record:
+            return False
+        return verify_password(secret, str(record.get("password_hash") or ""))
+    if mode == "pin":
+        stored = load_redact_guard().get("pin_hash")
+        if not stored:
+            return False
+        return verify_password(secret, str(stored))
+    return True
+
+
+def initial_panel_page(cfg: dict[str, Any]) -> int:
+    if not cfg.get("display", {}).get("remember_panel_page", True):
+        return 0
+    try:
+        return max(0, int(load_ui_state(cfg).get("panel_page") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def initial_redact_session(cfg: dict[str, Any]) -> bool:
+    return bool(load_ui_state(cfg).get("redact"))
+
+
+def redact_level(cfg: dict[str, Any]) -> str:
+    level = str(cfg.get("display", {}).get("redact_level") or "partial").lower()
+    return level if level in ("partial", "full") else "partial"
+
+
+def _redact_full(value: str) -> str:
+    return REDACT_CHAR * len(value) if value else value
+
+
+def redact_ip(value: str, level: str) -> str:
+    if not value:
+        return value
+    if level == "full":
+        return _redact_full(value)
+    # Mask digits and hex (IPv6 / MagicDNS) — keep . : only.
+    return "".join(REDACT_CHAR if ch.isalnum() else ch for ch in value)
+
+
+def redact_mac(value: str, level: str) -> str:
+    if not value:
+        return value
+    if level == "full":
+        return _redact_full(value)
+    return "".join(REDACT_CHAR if ch.isalnum() else ch for ch in value)
+
+
+def redact_name(value: str, level: str) -> str:
+    if not value:
+        return value
+    if level == "full":
+        return _redact_full(value)
+    # No edge peek — mask every letter/digit (includes _ in hostnames).
+    return "".join(REDACT_CHAR if ch.isalnum() else ch for ch in value)
+
+
+def redact_text(value: str, level: str) -> str:
+    """Connections, notes, services — mask all alnum; keep layout punctuation."""
+    if not value:
+        return value
+    if level == "full":
+        return _redact_full(value)
+    return "".join(REDACT_CHAR if ch.isalnum() else ch for ch in value)
+
+
+def rt(value: str, kind: str, cfg: dict[str, Any], session: UiSession | None) -> str:
+    if not session or not session.redact or not value:
+        return value
+    level = redact_level(cfg)
+    if kind == "ip":
+        return redact_ip(value, level)
+    if kind == "mac":
+        return redact_mac(value, level)
+    if kind == "text":
+        return redact_text(value, level)
+    return redact_name(value, level)
+
+
+def search_matches(text: str, query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    return q in (text or "").lower()
+
+
+def apply_search_attr(base: int, line: str, session: UiSession | None) -> int:
+    if session and session.search_query and not search_matches(line, session.search_query):
+        return cp(CP_WHITE, dim=True)
+    return base
+
+
+def copy_to_clipboard(text: str) -> bool:
+    payload = (text or "").strip()
+    if not payload:
+        return False
+    data = payload.encode("utf-8", errors="replace")
+    for cmd in (
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ):
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, input=data, check=False, timeout=3)
+            return True
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return False
+
+
+def snooze_until(hours: int) -> str:
+    return time.strftime(
+        "%Y-%m-%dT%H:%M:%S",
+        time.localtime(time.time() + max(1, hours) * 3600),
+    )
+
+
+def load_snooze_map() -> dict[str, str]:
+    state = load_alert_state()
+    raw = state.get("snoozed") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def is_snooze_active(until: str | None) -> bool:
+    if not until:
+        return False
+    try:
+        end = time.mktime(time.strptime(until, "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return False
+    return time.time() < end
+
+
+def is_snoozed_mac(mac: str, snoozed: dict[str, str] | None = None) -> bool:
+    snoozed = snoozed if snoozed is not None else load_snooze_map()
+    return is_snooze_active(snoozed.get(f"mac:{mac.lower()}"))
+
+
+def is_snoozed_ip(ip: str, snoozed: dict[str, str] | None = None) -> bool:
+    snoozed = snoozed if snoozed is not None else load_snooze_map()
+    return is_snooze_active(snoozed.get(f"ip:{ip}"))
+
+
+def snooze_pending_alerts(cfg: dict[str, Any], dash: DashboardState) -> tuple[int, int]:
+    hours = int(cfg.get("snooze", {}).get("default_hours") or 24)
+    until = snooze_until(hours)
+    state = load_alert_state()
+    snoozed = state.setdefault("snoozed", {})
+    n_lan = 0
+    n_inbound = 0
+    for mac in dash.new_macs:
+        snoozed[f"mac:{mac.lower()}"] = until
+        n_lan += 1
+    for ip in dash.new_inbound:
+        snoozed[f"ip:{ip}"] = until
+        n_inbound += 1
+    save_alert_state(state)
+    return n_lan, n_inbound
+
+
+def clipboard_focus_payload(cfg: dict[str, Any], dash: DashboardState, session: UiSession) -> str:
+    if session.search_query:
+        for dev in dash.devices:
+            blob = f"{dev.ip} {dev.mac} {dev.label} {dev.guess} {dev.hostname}"
+            if search_matches(blob, session.search_query):
+                return f"{dev.ip}\t{dev.mac}\t{dev.label or dev.guess or '?'}"
+        for flow in dash.inbound:
+            blob = f"{flow.remote_ip} {flow.name} {flow.proc} {flow.service}"
+            if search_matches(blob, session.search_query):
+                return f"{flow.remote_ip}\t{flow.service}\t{flow.name}"
+        for flow in dash.outbound:
+            blob = f"{flow.connection} {flow.name} {flow.notes}"
+            if search_matches(blob, session.search_query):
+                return f"{flow.connection}\t{flow.name}\t{flow.notes}"
+    if dash.new_macs:
+        dev = next(d for d in dash.devices if d.mac in dash.new_macs)
+        return f"{dev.ip}\t{dev.mac}\t{dev.label or dev.guess or '?'}"
+    if dash.new_inbound:
+        flow = next((f for f in dash.inbound if f.remote_ip in dash.new_inbound), None)
+        if flow:
+            return f"{flow.remote_ip}\t{flow.service}\t{flow.name}"
+    if dash.devices:
+        dev = dash.devices[0]
+        return f"{dev.ip}\t{dev.mac}\t{dev.label or dev.guess or '?'}"
+    _, gateway, local = default_route()
+    return f"local={local or '?'} gateway={gateway or '?'}"
+
+
+def prompt_search(stdscr, cfg: dict[str, Any], session: UiSession, y: int, w: int) -> None:
+    query = prompt_line(stdscr, y, "▸ filter (empty clears): ", w)
+    session.search_query = query.strip()
 
 
 @dataclass
@@ -1131,6 +1467,8 @@ def device_needs_attention(
     """Stay flagged until the user labels, trusts, or blocks the device."""
     if is_blocked_mac(cfg, dev.mac):
         return False
+    if is_snoozed_mac(dev.mac):
+        return False
     entry = known.get(dev.mac) or {}
     if entry.get("acknowledged") or entry.get("trusted"):
         return False
@@ -1679,15 +2017,25 @@ def outbound_flows(
     return flows
 
 
-def format_outbound_lines(flows: list[OutboundFlow], width: int, limit: int = 8) -> list[str]:
+def format_outbound_lines(
+    flows: list[OutboundFlow],
+    width: int,
+    limit: int = 8,
+    *,
+    cfg: dict[str, Any] | None = None,
+    session: UiSession | None = None,
+) -> list[str]:
     flows = flows[:limit]
     if not flows:
         return ["(no established sessions)"]
     if width < 36:
         rows = ["◈ connection → name"]
         for f in flows:
-            rows.append(f.connection[: width - 1])
-            rows.append(f"  {f.name[:16]}  {f.notes}"[: width - 1])
+            conn = rt(f.connection, "text", cfg or {}, session)
+            name = rt(f.name, "name", cfg or {}, session)
+            notes = rt(f.notes, "text", cfg or {}, session)
+            rows.append(conn[: width - 1])
+            rows.append(f"  {name[:16]}  {notes}"[: width - 1])
         return rows
 
     conn_w = max(14, min(width - 18, int(width * 0.40)))
@@ -1698,7 +2046,10 @@ def format_outbound_lines(flows: list[OutboundFlow], width: int, limit: int = 8)
         ("─" * (width - 1))[: width - 1],
     ]
     for f in flows:
-        row = f"{f.connection[:conn_w]:<{conn_w}} {f.name[:name_w]:<{name_w}} {f.notes[:note_w]}"
+        conn = rt(f.connection, "text", cfg or {}, session)
+        name = rt(f.name, "name", cfg or {}, session)
+        notes = rt(f.notes, "text", cfg or {}, session)
+        row = f"{conn[:conn_w]:<{conn_w}} {name[:name_w]:<{name_w}} {notes[:note_w]}"
         rows.append(row[: width - 1])
     return rows
 
@@ -2025,6 +2376,7 @@ def inbound_flows(
     listen = _listening_sockets()
     eph_lo, eph_hi = _ephemeral_port_range()
     trusted = load_trusted_peers(cfg)
+    snoozed = load_snooze_map()
     _, gateway, local_ip = default_route()
     dns_cache: dict[str, str] = {}
     flows: list[InboundFlow] = []
@@ -2069,7 +2421,9 @@ def inbound_flows(
             dns_cache=dns_cache,
         )
         service = _service_label(local_port, proc)
-        is_new = not is_trusted_inbound_ip(cfg, remote_ip, trusted)
+        is_new = not is_trusted_inbound_ip(cfg, remote_ip, trusted) and not is_snoozed_ip(
+            remote_ip, snoozed
+        )
         if is_new and remote_ip not in new_ips:
             new_ips.append(remote_ip)
 
@@ -2089,7 +2443,14 @@ def inbound_flows(
     return flows, new_ips
 
 
-def format_inbound_lines(flows: list[InboundFlow], width: int, limit: int = 6) -> list[str]:
+def format_inbound_lines(
+    flows: list[InboundFlow],
+    width: int,
+    limit: int = 6,
+    *,
+    cfg: dict[str, Any] | None = None,
+    session: UiSession | None = None,
+) -> list[str]:
     flows = flows[:limit]
     if not flows:
         return ["(no inbound sessions)"]
@@ -2097,7 +2458,11 @@ def format_inbound_lines(flows: list[InboundFlow], width: int, limit: int = 6) -
         rows: list[str] = []
         for f in flows:
             tag = "▸NEW" if f.is_new else ""
-            rows.append(f"{f.remote_ip[:14]} → :{f.service}{tag}"[: width - 1])
+            if session and session.redact:
+                tag = rt(tag, "text", cfg or {}, session)
+            rip = rt(f.remote_ip, "ip", cfg or {}, session)
+            svc = rt(f.service, "text", cfg or {}, session)
+            rows.append(f"{rip[:14]} → :{svc}{tag}"[: width - 1])
         return rows
 
     peer_w = max(10, min(width - 16, int(width * 0.34)))
@@ -2107,10 +2472,13 @@ def format_inbound_lines(flows: list[InboundFlow], width: int, limit: int = 6) -
     rows.append(("─" * (width - 1))[: width - 1])
     for f in flows:
         tag = "*" if f.is_new else " "
+        name = rt(f.name, "name", cfg or {}, session)
+        service = rt(f.service, "text", cfg or {}, session)
+        proc = rt(f.proc, "text", cfg or {}, session)
         row = (
-            f"{tag}{f.name[: peer_w - 1]:<{peer_w - 1}} "
-            f"{f.service[:svc_w]:<{svc_w}} "
-            f"{f.proc[:proc_w]}"
+            f"{tag}{name[: peer_w - 1]:<{peer_w - 1}} "
+            f"{service[:svc_w]:<{svc_w}} "
+            f"{proc[:proc_w]}"
         )
         rows.append(row[: width - 1])
     return rows
@@ -2492,7 +2860,9 @@ def wipe_local_user_data(cfg: dict[str, Any] | None = None) -> list[str]:
         (BLOCKED_PATH, "{}\n"),
         (TRUSTED_PEERS_PATH, "{}\n"),
         (MANUAL_PATH, "[]\n"),
-        (ALERT_STATE_PATH, '{"notified_macs": {}}\n'),
+        (ALERT_STATE_PATH, '{"notified_macs": {}, "snoozed": {}}\n'),
+        (UI_STATE_PATH, '{"panel_page": 0, "redact": false}\n'),
+        (UI_STATE_PATH, '{"panel_page": 0, "redact": false}\n'),
         (expand_path(cfg["alerts"]["state_file"]), "{}\n"),
         (
             SECRETS_PATH,
@@ -2882,6 +3252,229 @@ def gate_capability(stdscr, cfg: dict[str, Any], gap: CapabilityGap | None) -> t
     if not ok:
         return False, msg
     return True, msg
+
+
+def _draw_redact_modal(
+    stdscr,
+    *,
+    title: str,
+    body: list[str],
+    options: list[tuple[str, str, bool]],
+    footer: str,
+    pair: int = CP_MAGENTA,
+) -> tuple[int, int, int, int]:
+    """Draw centered cyber modal. options: (key_label, text, enabled). Returns box bounds."""
+    h, w = stdscr.getmaxyx()
+    box_w = min(max(48, w - 4), 74)
+    box_h = min(max(14, len(body) + len(options) + 9), h - 4)
+    box_y = max(1, (h - box_h) // 2)
+    box_x = max(0, (w - box_w) // 2)
+    draw_cyber_panel(stdscr, box_y, box_x, box_h, box_w, title, pair=pair)
+    y = box_y + 1
+    for line in body[: box_h - len(options) - 8]:
+        safe_addstr(stdscr, y, box_x + 2, line[: box_w - 4], cp(CP_YELLOW, dim=True))
+        y += 1
+    y = max(y, box_y + box_h - len(options) - 5)
+    for key_label, text, enabled in options:
+        line = f" {key_label}  {text} "
+        attr = cp(CP_CYAN, bold=True) if enabled else cp(CP_WHITE, dim=True)
+        safe_addstr(stdscr, y, box_x + 2, line[: box_w - 4], attr)
+        y += 1
+    safe_addstr(stdscr, h - 2, 2, footer[: w - 4], cp(CP_MAGENTA, dim=True))
+    stdscr.refresh()
+    return box_y, box_x, box_h, box_w
+
+
+def show_redact_guard_setup_modal(stdscr) -> str:
+    """Return password | pin | none | cancel."""
+    has_login = bool(load_auth_record())
+    stdscr.timeout(-1)
+    try:
+        while True:
+            stdscr.erase()
+            body = [
+                "Classified view hides IPs, MACs, and hostnames on screen.",
+                "Choose how to unlock when you turn redact off:",
+            ]
+            if not has_login:
+                body.append("▸ netwatch login not found — password lock unavailable")
+            options: list[tuple[str, str, bool]] = []
+            if has_login:
+                options.append(("P", "password — reuse your netwatch login", True))
+            else:
+                options.append(("P", "password — needs netwatch login first", False))
+            options.extend(
+                [
+                    ("I", "PIN — 4–6 digit numeric code", True),
+                    ("N", "none — toggle off freely (no unlock)", True),
+                ]
+            )
+            _draw_redact_modal(
+                stdscr,
+                title="VISIBILITY GUARD // REDACT LOCK",
+                body=body,
+                options=options,
+                footer="▸ neural privacy gate — Esc cancels",
+                pair=CP_MAGENTA,
+            )
+            ch = stdscr.getch()
+            if ch in (27, ord("q"), ord("Q")):
+                return "cancel"
+            if ch in (ord("p"), ord("P")) and has_login:
+                return "password"
+            if ch in (ord("i"), ord("I")):
+                return "pin"
+            if ch in (ord("n"), ord("N")):
+                return "none"
+    finally:
+        stdscr.timeout(IDLE_TIMEOUT_MS)
+
+
+def configure_redact_pin(stdscr) -> bool:
+    """Collect and confirm a 4–6 digit PIN. Returns True when saved."""
+    stdscr.timeout(-1)
+    try:
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            body = [
+                "PIN must be 4–6 digits (numbers only).",
+                "Stored hashed in ui_state.json (chmod 600).",
+            ]
+            _draw_redact_modal(
+                stdscr,
+                title="VISIBILITY GUARD // SET PIN",
+                body=body,
+                options=[("Esc", "cancel setup", True)],
+                footer="▸ enter PIN at bottom · masked input",
+                pair=CP_ALERT,
+            )
+            pin = prompt_secret_line(stdscr, h - 3, "PIN: ", w)
+            if not pin:
+                return False
+            if not pin.isdigit() or not (4 <= len(pin) <= 6):
+                stdscr.erase()
+                _draw_redact_modal(
+                    stdscr,
+                    title="VISIBILITY GUARD // SET PIN",
+                    body=["Invalid PIN — use 4–6 digits only.", "Press any key…"],
+                    options=[],
+                    footer="",
+                    pair=CP_ALERT,
+                )
+                stdscr.getch()
+                continue
+            confirm = prompt_secret_line(stdscr, h - 3, "Confirm PIN: ", w)
+            if not confirm:
+                return False
+            if confirm != pin:
+                stdscr.erase()
+                _draw_redact_modal(
+                    stdscr,
+                    title="VISIBILITY GUARD // SET PIN",
+                    body=["PINs did not match.", "Press any key to retry…"],
+                    options=[],
+                    footer="",
+                    pair=CP_ALERT,
+                )
+                stdscr.getch()
+                continue
+            save_redact_guard({"configured": True, "mode": "pin", "pin_hash": hash_password(pin)})
+            return True
+    finally:
+        stdscr.timeout(IDLE_TIMEOUT_MS)
+
+
+def show_redact_unlock_modal(stdscr, mode: str) -> bool:
+    """Prompt for password or PIN to disable redact. Returns True when verified."""
+    label = "login password" if mode == "password" else "PIN"
+    stdscr.timeout(-1)
+    try:
+        while True:
+            stdscr.erase()
+            body = [
+                "Redact is active — sensitive fields are masked.",
+                f"Enter your {label} to declassify the dashboard.",
+            ]
+            _draw_redact_modal(
+                stdscr,
+                title="VISIBILITY UNLOCK // DECLASSIFY",
+                body=body,
+                options=[("Esc", "stay classified", True)],
+                footer="▸ unlock gate — Enter submits · Esc cancels",
+                pair=CP_ALERT,
+            )
+            h, w = stdscr.getmaxyx()
+            secret = prompt_secret_line(stdscr, h - 3, f"{label.upper()}: ", w)
+            if not secret:
+                return False
+            if verify_redact_unlock(secret, mode):
+                return True
+            stdscr.erase()
+            _draw_redact_modal(
+                stdscr,
+                title="VISIBILITY UNLOCK // DECLASSIFY",
+                body=[f"Wrong {label}.", "Press any key to retry or Esc…"],
+                options=[],
+                footer="",
+                pair=CP_ALERT,
+            )
+            ch = stdscr.getch()
+            if ch == 27:
+                return False
+    finally:
+        stdscr.timeout(IDLE_TIMEOUT_MS)
+
+
+def toggle_redact_with_guard(
+    stdscr,
+    cfg: dict[str, Any],
+    session: UiSession,
+    ui_status: FlashStatus,
+) -> None:
+    """First V configures visibility guard; protected redact-off needs unlock."""
+    if not redact_guard_configured():
+        choice = show_redact_guard_setup_modal(stdscr)
+        if choice == "cancel":
+            ui_status.flash("visibility guard cancelled")
+            return
+        if choice == "password":
+            if not load_auth_record():
+                ui_status.flash("no netwatch login — pick PIN or none")
+                return
+            save_redact_guard({"configured": True, "mode": "password"})
+            ui_status.flash("redact on — unlock with login password")
+        elif choice == "pin":
+            if not configure_redact_pin(stdscr):
+                ui_status.flash("PIN setup cancelled")
+                return
+            ui_status.flash("redact on — unlock with PIN")
+        else:
+            save_redact_guard({"configured": True, "mode": "none"})
+            ui_status.flash("redact on — no unlock required")
+        session.redact = True
+        save_ui_state(cfg, redact=True)
+        return
+
+    if not session.redact:
+        session.redact = True
+        save_ui_state(cfg, redact=True)
+        ui_status.flash("redact on — classified view")
+        return
+
+    mode = redact_guard_mode()
+    if mode == "none":
+        session.redact = False
+        save_ui_state(cfg, redact=False)
+        ui_status.flash("redact off")
+        return
+
+    if show_redact_unlock_modal(stdscr, mode):
+        session.redact = False
+        save_ui_state(cfg, redact=False)
+        ui_status.flash("redact off — declassified")
+    else:
+        ui_status.flash("still classified")
 
 
 class ZTERouterBlocker:
@@ -3384,16 +3977,49 @@ def save_alert_state(state: dict[str, Any]) -> None:
     ALERT_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
-def should_notify_mac(mac: str, state: dict[str, Any], repeat_hours: int) -> bool:
+def should_notify_mac(
+    mac: str,
+    state: dict[str, Any],
+    repeat_hours: int,
+    *,
+    ip: str | None = None,
+    dedupe_ip: bool = True,
+) -> bool:
     notified = state.get("notified_macs") or {}
-    last = notified.get(mac.lower())
-    if not last:
+    raw = notified.get(mac.lower())
+    if not raw:
         return True
-    try:
-        last_ts = time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%S"))
-    except ValueError:
-        return True
-    return (time.time() - last_ts) >= max(1, repeat_hours) * 3600
+    now = time.time()
+    window = max(1, repeat_hours) * 3600
+
+    def _last_ts(value: str | None) -> float | None:
+        if not value:
+            return None
+        try:
+            return time.mktime(time.strptime(str(value), "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            return None
+
+    if isinstance(raw, dict):
+        last_ts = _last_ts(raw.get("at"))
+        if last_ts is None:
+            return True
+        if dedupe_ip and ip and raw.get("ip") == ip and (now - last_ts) < window:
+            return False
+        return (now - last_ts) >= window
+    if isinstance(raw, str):
+        last_ts = _last_ts(raw)
+        if last_ts is None:
+            return True
+        return (now - last_ts) >= window
+    return True
+
+
+def record_notification(state: dict[str, Any], key: str, *, ip: str = "") -> None:
+    state.setdefault("notified_macs", {})[key.lower()] = {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "ip": ip or "",
+    }
 
 
 def send_desktop_notify(title: str, body: str) -> bool:
@@ -3448,7 +4074,7 @@ def format_unknown_alert(devices: list[LanDevice], known: dict[str, dict]) -> st
         name = device_display_name(dev.mac, known)
         rnd = " [random MAC]" if is_random_mac(dev.mac) else ""
         lines.append(f"  • {dev.ip}  {dev.mac}  {name}{rnd}  ({dev.state})")
-    lines.extend(["", "Run: netwatch → press i to identify, b to block.", "Ack trusted: press a on dashboard."])
+    lines.extend(["", "Run: netwatch → press i to identify, b to block.", "Trust: press T on dashboard."])
     return "\n".join(lines)
 
 
@@ -3525,8 +4151,13 @@ def deliver_unknown_alerts(cfg: dict[str, Any], unknown: list[LanDevice]) -> lis
 
     known = load_known(expand_path(cfg["alerts"]["state_file"]))
     repeat_hours = int(cfg.get("notifications", {}).get("repeat_hours") or 24)
+    dedupe_ip = bool(cfg.get("notifications", {}).get("dedupe_same_ip", True))
     state = load_alert_state()
-    notify_list = [d for d in unknown if should_notify_mac(d.mac, state, repeat_hours)]
+    notify_list = [
+        d
+        for d in unknown
+        if should_notify_mac(d.mac, state, repeat_hours, ip=d.ip, dedupe_ip=dedupe_ip)
+    ]
     if not notify_list:
         return ["alert suppressed (already notified recently)"]
 
@@ -3544,9 +4175,8 @@ def deliver_unknown_alerts(cfg: dict[str, Any], unknown: list[LanDevice]) -> lis
     elif cfg.get("notifications", {}).get("email", {}).get("enabled"):
         messages.append(f"email failed: {msg}")
 
-    now = time.strftime("%Y-%m-%dT%H:%M:%S")
     for dev in notify_list:
-        state.setdefault("notified_macs", {})[dev.mac.lower()] = now
+        record_notification(state, dev.mac, ip=dev.ip)
     save_alert_state(state)
     return messages or ["alert recorded"]
 
@@ -3579,11 +4209,18 @@ def deliver_inbound_alerts(cfg: dict[str, Any], flows: list[InboundFlow]) -> lis
         return []
 
     repeat_hours = int(cfg.get("notifications", {}).get("repeat_hours") or 24)
+    dedupe_ip = bool(cfg.get("notifications", {}).get("dedupe_same_ip", True))
     state = load_alert_state()
     notify_ips = [
         f.remote_ip
         for f in untrusted
-        if should_notify_mac(f"inbound:{f.remote_ip}", state, repeat_hours)
+        if should_notify_mac(
+            f"inbound:{f.remote_ip}",
+            state,
+            repeat_hours,
+            ip=f.remote_ip,
+            dedupe_ip=dedupe_ip,
+        )
     ]
     if not notify_ips:
         return ["inbound alert suppressed (already notified recently)"]
@@ -3603,9 +4240,8 @@ def deliver_inbound_alerts(cfg: dict[str, Any], flows: list[InboundFlow]) -> lis
     elif cfg.get("notifications", {}).get("email", {}).get("enabled"):
         messages.append(f"inbound email failed: {msg}")
 
-    now = time.strftime("%Y-%m-%dT%H:%M:%S")
     for ip in notify_ips:
-        state.setdefault("notified_macs", {})[f"inbound:{ip}"] = now
+        record_notification(state, f"inbound:{ip}", ip=ip)
     save_alert_state(state)
     return messages or ["inbound alert recorded"]
 
@@ -3808,31 +4444,14 @@ def reload_labels(cfg: dict[str, Any], iface: str, dash: DashboardState) -> Dash
 CYBER_SPINNERS = ("◢◣◢◣", "◣◢◣◢", "◢◣◢◣", "◥◤◥◤")
 CYBER_BAR_LEVELS = "░▒▓█"
 
-# Color pairs — init in init_cyber_theme()
-CP_ALERT = 1
-CP_CYAN = 2
-CP_MAGENTA = 3
-CP_GREEN = 4
-CP_YELLOW = 5
-CP_BLUE = 6
-CP_WHITE = 7
 
-
-def init_cyber_theme() -> None:
+def init_cyber_theme(theme: str = "cyber") -> None:
     curses.start_color()
     curses.use_default_colors()
-    pairs = (
-        (CP_ALERT, curses.COLOR_RED, -1),
-        (CP_CYAN, curses.COLOR_CYAN, -1),
-        (CP_MAGENTA, curses.COLOR_MAGENTA, -1),
-        (CP_GREEN, curses.COLOR_GREEN, -1),
-        (CP_YELLOW, curses.COLOR_YELLOW, -1),
-        (CP_BLUE, curses.COLOR_BLUE, -1),
-        (CP_WHITE, curses.COLOR_WHITE, -1),
-    )
-    for idx, fg, bg in pairs:
+    palette = THEME_PALETTES.get(str(theme).lower(), THEME_PALETTES["cyber"])
+    for idx, fg in palette.items():
         try:
-            curses.init_pair(idx, fg, bg)
+            curses.init_pair(idx, fg, -1)
         except curses.error:
             pass
 
@@ -4102,10 +4721,16 @@ def build_dashboard_panels(
     dash: DashboardState,
     scanned: bool,
     content_w: int = 36,
+    ui_session: UiSession | None = None,
 ) -> list[DashboardPanel]:
     """Build all panel containers dynamically from config + live state."""
     cap = items_per_panel(cfg)
     content_w = max(16, content_w)
+    scan_k = binding_label(cfg, "scan")
+    sync_k = binding_label(cfg, "refresh")
+    trust_k = binding_label(cfg, "trust")
+    detail_k = binding_label(cfg, "host_exposure")
+    opts_k = binding_label(cfg, "options")
     panels: list[DashboardPanel] = []
     he = cfg.get("host_exposure", {})
     router_on = cfg["router"].get("enabled") and (cfg["router"].get("type") or "disabled").lower() != "disabled"
@@ -4121,15 +4746,20 @@ def build_dashboard_panels(
         tag = " ▸NEW" if d.is_new else ""
         if is_blocked_mac(cfg, d.mac):
             tag = " ⛔BLOCK"
+        if ui_session and ui_session.redact and tag:
+            tag = rt(tag.strip(), "text", cfg, ui_session)
+            tag = f" {tag}" if tag else ""
         name = (d.label or d.guess or d.hostname or "?")[:name_w]
-        lan_lines.append(f"{d.ip:<{ip_w}} {name:<{name_w}}{tag}"[:content_w])
+        ip_disp = rt(d.ip, "ip", cfg, ui_session)
+        name_disp = rt(name, "name", cfg, ui_session)
+        lan_lines.append(f"{ip_disp:<{ip_w}} {name_disp:<{name_w}}{tag}"[:content_w])
         lan_attrs.append(_lan_line_attr(d, scanned))
     panels.append(
         DashboardPanel(
             "lan",
             "LAN :: nodes",
             CP_CYAN,
-            lan_lines or ["(no nodes — S·house scan)"],
+            lan_lines or [f"(no nodes — {scan_k}·house scan)"],
             lan_attrs or None,
             total=len(dash.devices),
         )
@@ -4140,15 +4770,17 @@ def build_dashboard_panels(
         ts_attrs: list[int] = []
         for p in dash.tailscale[:cap]:
             glyph = "◉" if p.online else "○"
-            name_w = max(10, content_w - len(p.ip) - 3)
-            ts_lines.append(f"{glyph} {p.name[:name_w]:<{name_w}} {p.ip}"[:content_w])
+            peer_ip = rt(p.ip, "ip", cfg, ui_session)
+            name_w = max(10, content_w - len(peer_ip) - 3)
+            peer_name = rt(p.name[:name_w], "name", cfg, ui_session)
+            ts_lines.append(rt(f"{glyph} {peer_name:<{name_w}} {peer_ip}", "text", cfg, ui_session)[:content_w])
             ts_attrs.append(cp(CP_GREEN, bold=True) if p.online else cp(CP_BLUE, dim=True))
         panels.append(
             DashboardPanel(
                 "tailscale",
                 "MESH :: tailscale",
                 CP_MAGENTA,
-                ts_lines or ["(mesh offline)"],
+                ts_lines or [f"(mesh offline — {sync_k}·sync · check tailscale)"],
                 ts_attrs or None,
                 total=len(dash.tailscale),
             )
@@ -4158,31 +4790,37 @@ def build_dashboard_panels(
         rlines = []
         for c in dash.router_clients[:cap]:
             name_w = max(8, content_w - len(c.ip) - 4)
-            rlines.append(f"◈ {(c.name or '?')[:name_w]:<{name_w}} {c.ip}"[:content_w])
+            rname = rt((c.name or "?")[:name_w], "name", cfg, ui_session)
+            rip = rt(c.ip, "ip", cfg, ui_session)
+            rlines.append(f"◈ {rname:<{name_w}} {rip}"[:content_w])
         panels.append(
             DashboardPanel(
                 "router",
                 "ROUTER :: dhcp",
                 CP_YELLOW,
-                rlines or ["(no uplink data)"],
+                rlines or [f"(no uplink — {opts_k}·opts enable router panel)"],
                 total=len(dash.router_clients),
             )
         )
 
-    out_lines = format_outbound_lines(dash.outbound, content_w, limit=cap)
+    out_lines = format_outbound_lines(
+        dash.outbound, content_w, limit=cap, cfg=cfg, session=ui_session
+    )
     panels.append(
         DashboardPanel(
             "outbound",
             "NET :: outbound",
             CP_GREEN,
-            out_lines,
+            out_lines or [f"(no sessions — {sync_k}·sync)"],
             total=len(dash.outbound),
         )
     )
 
     if he.get("enabled", True):
         if he.get("monitor_inbound", True):
-            in_lines = format_inbound_lines(dash.inbound, content_w, limit=cap)
+            in_lines = format_inbound_lines(
+                dash.inbound, content_w, limit=cap, cfg=cfg, session=ui_session
+            )
             in_attrs = [
                 cp(CP_ALERT, bold=True) if f.is_new else cp(CP_GREEN)
                 for f in dash.inbound[:cap]
@@ -4194,7 +4832,7 @@ def build_dashboard_panels(
                     "inbound",
                     "HOST :: inbound",
                     CP_ALERT,
-                    in_lines or ["(no inbound sessions)"],
+                    in_lines or [f"(no inbound — {detail_k}·detail · {trust_k}·trust)"],
                     in_attrs,
                     total=len(dash.inbound),
                 )
@@ -4202,7 +4840,9 @@ def build_dashboard_panels(
 
         if he.get("monitor_listeners", True):
             exp_lines = [
-                f"{'!' if e.risk == 'alert' else '·'} :{e.port} {format_listener_label(e)}"[:content_w]
+                f"{'!' if e.risk == 'alert' else '·'} :{rt(str(e.port), 'text', cfg, ui_session)} {rt(format_listener_label(e), 'name', cfg, ui_session)}"[
+                    :content_w
+                ]
                 for e in dash.exposed[:cap]
             ]
             panels.append(
@@ -4210,7 +4850,7 @@ def build_dashboard_panels(
                     "exposed",
                     "HOST :: exposed",
                     CP_YELLOW,
-                    exp_lines or ["(no LAN listeners)"],
+                    exp_lines or [f"(no LAN listeners — {detail_k}·detail)"],
                     total=len(dash.exposed),
                 )
             )
@@ -4218,24 +4858,32 @@ def build_dashboard_panels(
         if he.get("monitor_bridges", True):
             path_lines: list[str] = []
             for b in dash.bridges[:cap]:
-                path_lines.append(f"◈ {b.name} ({b.state})"[:content_w])
-                path_lines.append(f"  {b.note[: content_w - 2]}"[:content_w])
+                state = rt(b.state, "text", cfg, ui_session)
+                path_lines.append(
+                    f"◈ {rt(b.name, 'name', cfg, ui_session)} ({state})"[:content_w]
+                )
+                path_lines.append(f"  {rt(b.note[: content_w - 2], 'text', cfg, ui_session)}"[:content_w])
             if dash.login_sessions:
-                path_lines.append("── logins ──")
-                path_lines.extend(dash.login_sessions[: max(1, cap // 3)])
+                path_lines.append(rt("── logins ──", "text", cfg, ui_session))
+                path_lines.extend(
+                    rt(s, "text", cfg, ui_session)
+                    for s in dash.login_sessions[: max(1, cap // 3)]
+                )
             panels.append(
                 DashboardPanel(
                     "paths",
                     "HOST :: paths",
                     CP_MAGENTA,
-                    path_lines or ["(no bridges/tunnels)"],
+                    path_lines or [f"(no bridges — {sync_k}·sync)"],
                     total=len(dash.bridges) + len(dash.login_sessions),
                 )
             )
 
-    defense = [f"◈ fw · {firewall_state()[: max(8, content_w - 8)]}"[:content_w]]
-    defense.extend(quarantine_lines(dash.blocked, min(cap, 8), content_w))
-    defense.extend(failed_logins()[: max(0, cap - len(defense))])
+    defense = [f"◈ fw · {rt(firewall_state()[: max(8, content_w - 8)], 'text', cfg, ui_session)}"[:content_w]]
+    defense.extend(quarantine_lines(dash.blocked, min(cap, 8), content_w, cfg, ui_session))
+    defense.extend(
+        rt(line, "text", cfg, ui_session) for line in failed_logins()[: max(0, cap - len(defense))]
+    )
     panels.append(
         DashboardPanel(
             "defense",
@@ -4266,11 +4914,18 @@ CONFIG_TOGGLES: list[tuple[list[str], str]] = [
     (["countermeasures", "block_by_mac"], "Firewall block by MAC address"),
     (["countermeasures", "router_block", "enabled"], "Router Wi‑Fi MAC deny"),
     (["notifications", "enabled"], "Notifications (cron/check)"),
+    (["notifications", "dedupe_same_ip"], "Dedupe alerts (same IP)"),
     (["notifications", "desktop", "enabled"], "Desktop notifications"),
+    (["display", "remember_panel_page"], "Remember dashboard panel page"),
     (["identify", "auto_enrich"], "Auto-enrich device names"),
     (["identify", "auto_probe_unknown"], "Auto-probe unknown devices"),
     (["harnesses", "enabled"], "YAML probe harnesses"),
     (["scan", "use_nmap_if_available"], "Use nmap for house scan"),
+]
+
+CONFIG_CYCLES: list[tuple[list[str], str, tuple[str, ...]]] = [
+    (["display", "theme"], "Color theme", ("cyber", "synthwave", "amber")),
+    (["display", "redact_level"], "Redact style (V) partial|full", ("partial", "full")),
 ]
 
 
@@ -4307,8 +4962,19 @@ def show_options(stdscr, cfg: dict[str, Any]) -> str:
                 if isinstance(val, bool):
                     toggle_items.append((path, label, val))
 
+            cycle_items: list[tuple[list[str], str, tuple[str, ...], str]] = []
+            for path, label, choices in CONFIG_CYCLES:
+                try:
+                    cur = str(cfg_get(cfg, path) or choices[0])
+                except (KeyError, TypeError):
+                    cur = choices[0]
+                if cur not in choices:
+                    cur = choices[0]
+                cycle_items.append((path, label, choices, cur))
+
             opt_lines: list[str] = []
             opt_attrs: list[int] = []
+            settings_count = len(toggle_items) + len(cycle_items)
             for i, (path, label, val) in enumerate(toggle_items):
                 mark = "ON " if val else "OFF"
                 line = f"[{mark}] {label}"
@@ -4318,7 +4984,16 @@ def show_options(stdscr, cfg: dict[str, Any]) -> str:
                 else:
                     attr = cp(CP_WHITE, dim=True)
                 opt_attrs.append(attr)
-            sel = min(sel, max(0, len(toggle_items) - 1))
+            base = len(toggle_items)
+            for j, (_path, label, _choices, cur) in enumerate(cycle_items):
+                idx = base + j
+                line = f"[{cur}] {label}"
+                opt_lines.append(line[: left_w - 4])
+                if pane == "settings" and idx == sel:
+                    opt_attrs.append(cp(CP_CYAN, bold=True))
+                else:
+                    opt_attrs.append(cp(CP_WHITE, dim=True))
+            sel = min(sel, max(0, settings_count - 1))
             put_lines(stdscr, 3, 2, left_w - 4, opt_lines, cp(CP_WHITE), line_attrs=opt_attrs)
 
             draw_cyber_panel(stdscr, 2, left_w + 1, h - 4, w - left_w - 2, keys_title, pair=CP_MAGENTA)
@@ -4383,10 +5058,19 @@ def show_options(stdscr, cfg: dict[str, Any]) -> str:
                 else:
                     kb_sel = min(len(kb_items) - 1, kb_sel + 1)
             if ch in (10, 13, ord(" ")):
-                if pane == "settings" and toggle_items:
+                if pane == "settings" and toggle_items and sel < len(toggle_items):
                     path, _label, val = toggle_items[sel]
                     cfg_set(cfg, path, not val)
                     ui_status.flash(f"toggled {'.'.join(path)}")
+                elif pane == "settings" and cycle_items and sel >= len(toggle_items):
+                    cidx = sel - len(toggle_items)
+                    path, _label, choices, cur = cycle_items[cidx]
+                    pos = choices.index(cur) if cur in choices else 0
+                    new_val = choices[(pos + 1) % len(choices)]
+                    cfg_set(cfg, path, new_val)
+                    if path == ["display", "theme"]:
+                        init_cyber_theme(new_val)
+                    ui_status.flash(f"{'.'.join(path)} → {new_val}")
                 elif pane == "keys" and kb_items:
                     capture_action = kb_items[kb_sel][0]
     finally:
@@ -4433,17 +5117,25 @@ def unknown_devices(devices: list[LanDevice], cfg: dict[str, Any]) -> list[LanDe
     return [d for d in devices if d.is_new and not is_blocked_mac(cfg, d.mac)]
 
 
-def quarantine_lines(blocked: list[BlockedEntry], limit: int = 4, width: int = 36) -> list[str]:
+def quarantine_lines(
+    blocked: list[BlockedEntry],
+    limit: int = 4,
+    width: int = 36,
+    cfg: dict[str, Any] | None = None,
+    session: UiSession | None = None,
+) -> list[str]:
     width = max(16, width)
     if not blocked:
         return ["◈ quarantine · empty"]
     online = sum(1 for b in blocked if b.online)
-    lines = [f"◈ quarantine · {len(blocked)} blocked · {online} online"[:width]]
+    lines = [rt(f"◈ quarantine · {len(blocked)} blocked · {online} online", "text", cfg or {}, session)[:width]]
     name_w = max(10, width // 3)
     for entry in blocked[:limit]:
         glyph = "◉ ONLINE" if entry.online else "○ offline"
-        name = (entry.label or entry.mac)[:name_w]
-        lines.append(f"  {name:<{name_w}} {entry.last_ip} {glyph}"[:width])
+        name = rt((entry.label or entry.mac)[:name_w], "name", cfg or {}, session)
+        ip = rt(entry.last_ip, "ip", cfg or {}, session)
+        mark = rt(glyph, "text", cfg or {}, session)
+        lines.append(f"  {name:<{name_w}} {ip} {mark}"[:width])
     if len(blocked) > limit:
         lines.append(f"  … +{len(blocked) - limit} more")
     return lines
@@ -4486,6 +5178,13 @@ def draw_cyber_footer(win, y: int, w: int, status: str, cfg: dict[str, Any] | No
     msg = f" ▸ {status} "
     safe_addstr(win, y, 0, msg[: w - len(keys) - 1], cp(CP_GREEN))
     safe_addstr(win, y, max(0, w - len(keys) - 1), keys[: w - 1], cp(CP_CYAN, dim=True))
+
+
+def draw_context_footer(win, y: int, w: int, status: str) -> None:
+    """Full-width screen legend (identify, host exposure) — no dashboard key strip."""
+    if y >= win.getmaxyx()[0] - 1 or w < 10:
+        return
+    safe_addstr(win, y, 0, f"▸ {status} "[: w - 1], cp(CP_YELLOW, dim=True), w)
 
 
 def put_lines(
@@ -4534,6 +5233,33 @@ def prompt_line(
         curses.curs_set(0)
 
 
+def prompt_secret_line(
+    stdscr,
+    y: int,
+    text: str,
+    w: int,
+    *,
+    max_len: int = 64,
+    restore_timeout_ms: int = IDLE_TIMEOUT_MS,
+) -> str:
+    """Read one hidden line — blocks until Enter (immune to idle flash timeouts)."""
+    curses.noecho()
+    curses.curs_set(1)
+    try:
+        stdscr.timeout(-1)
+        stdscr.move(y, 0)
+        stdscr.clrtoeol()
+        safe_addstr(stdscr, y, 0, text[: w - 1], cp(CP_YELLOW, bold=True), w)
+        stdscr.refresh()
+        field_w = max(1, min(max_len, w - len(text) - 1))
+        raw = stdscr.getstr(y, len(text), field_w)
+        return raw.decode("utf-8", errors="replace").strip()
+    finally:
+        stdscr.timeout(restore_timeout_ms)
+        curses.noecho()
+        curses.curs_set(0)
+
+
 def help_line_attr(line: str) -> int:
     if line.startswith("──"):
         return cp(CP_MAGENTA, bold=True)
@@ -4547,7 +5273,10 @@ def help_line_attr(line: str) -> int:
 
 
 def identify_rows(
-    devices: list[LanDevice], width: int, cfg: dict[str, Any] | None = None
+    devices: list[LanDevice],
+    width: int,
+    cfg: dict[str, Any] | None = None,
+    session: UiSession | None = None,
 ) -> tuple[list[str], list[int]]:
     header = f"{'#':>2}  {'IP':<15} {'NAME/GUESS':<16} {'VENDOR':<14} {'MAC':<17} NOTES"
     sep = "──" + ("─" * min(width - 3, len(header) - 2))
@@ -4557,13 +5286,17 @@ def identify_rows(
         mark = "▸" if d.is_new else " "
         if cfg and is_blocked_mac(cfg, d.mac):
             mark = "⛔"
-        name = (d.label or d.guess)[:16]
-        vendor = (d.vendor or "?")[:14]
-        notes = d.notes or d.state
+        name = rt((d.label or d.guess)[:16], "name", cfg or {}, session)
+        vendor = rt((d.vendor or "?")[:14], "name", cfg or {}, session)
+        ip = rt(d.ip, "ip", cfg or {}, session)
+        mac = rt(d.mac, "mac", cfg or {}, session)
+        notes_raw = d.notes or d.state
         if d.hostname and not d.label:
-            notes = f"{d.hostname[:20]} {notes}".strip()
+            notes = f"{rt(d.hostname[:20], 'name', cfg or {}, session)} {rt(notes_raw, 'text', cfg or {}, session)}".strip()
+        else:
+            notes = rt(notes_raw, "text", cfg or {}, session)
         rows.append(
-            f"{mark}{i:>2}  {d.ip:<15} {name:<16} {vendor:<14} {d.mac} {notes}"[: width - 1]
+            f"{mark}{i:>2}  {ip:<15} {name:<16} {vendor:<14} {mac} {notes}"[: width - 1]
         )
         if cfg and is_blocked_mac(cfg, d.mac):
             attrs.append(cp(CP_YELLOW, bold=True))
@@ -4671,14 +5404,58 @@ def show_quarantine_registry(stdscr, cfg: dict[str, Any], iface: str) -> str:
         stdscr.timeout(IDLE_TIMEOUT_MS)
 
 
-def show_identify(stdscr, cfg: dict[str, Any], iface: str) -> str:
+def handle_session_keys(
+    stdscr,
+    cfg: dict[str, Any],
+    dash: DashboardState,
+    iface: str,
+    session: UiSession,
+    ui_status: FlashStatus,
+    ch: int,
+    *,
+    y: int,
+    w: int,
+) -> bool:
+    """Shared V / Z / / / C handlers. Returns True if the key was consumed."""
+    if key_matches_action(cfg, ch, "redact"):
+        toggle_redact_with_guard(stdscr, cfg, session, ui_status)
+        return True
+    if key_matches_action(cfg, ch, "search"):
+        prompt_search(stdscr, cfg, session, y, w)
+        ui_status.flash(
+            f"filter: {session.search_query}" if session.search_query else "filter cleared"
+        )
+        return True
+    if key_matches_action(cfg, ch, "copy"):
+        payload = clipboard_focus_payload(cfg, dash, session)
+        ok = copy_to_clipboard(payload)
+        ui_status.flash(
+            "copied to clipboard" if ok else "clipboard unavailable (install wl-clipboard)"
+        )
+        return True
+    if key_matches_action(cfg, ch, "snooze"):
+        n_lan, n_inbound = snooze_pending_alerts(cfg, dash)
+        if n_lan or n_inbound:
+            parts = []
+            if n_lan:
+                parts.append(f"{n_lan} LAN")
+            if n_inbound:
+                parts.append(f"{n_inbound} inbound")
+            ui_status.flash(f"snoozed {' · '.join(parts)} for {int(cfg.get('snooze', {}).get('default_hours') or 24)}h")
+        else:
+            ui_status.flash("nothing to snooze")
+        return True
+    return False
+
+
+def show_identify(stdscr, cfg: dict[str, Any], iface: str, session: UiSession) -> str:
     cfg = load_config()
     ok, msg = gate_capability(stdscr, cfg, check_identify_gap(cfg))
     if not ok:
         return msg if msg != "cancelled" else ""
     ttl = status_flash_seconds(cfg)
     offset = 0
-    legend = "n probe · l label · b block · x unblock · m import · r refresh · q back"
+    legend = identify_status_legend(cfg)
     ui_status = FlashStatus(legend, ttl=ttl)
     frame = 0
     stdscr.timeout(IDLE_TIMEOUT_MS)
@@ -4688,16 +5465,21 @@ def show_identify(stdscr, cfg: dict[str, Any], iface: str) -> str:
             stdscr, "PROBE", collect_state, cfg, iface, False, force_identify=True
         )
         while True:
-            rows, row_attrs = identify_rows(dash.devices, stdscr.getmaxyx()[1], cfg)
+            rows, row_attrs = identify_rows(dash.devices, stdscr.getmaxyx()[1], cfg, session)
             stdscr.erase()
             h, w = stdscr.getmaxyx()
             pulse = cyber_pulse(frame)
             frame += 1
+            hud_extra = ""
+            if session.redact:
+                hud_extra += " ◈REDACT◈"
+            if session.search_query:
+                hud_extra += f" find:{session.search_query[:10]}"
             left = (
                 f" NETWATCH // IDENTIFY  {pulse}  "
-                f"nodes {len(dash.devices)}  new {len(dash.new_macs)} "
+                f"nodes {len(dash.devices)}  new {len(dash.new_macs)}{hud_extra} "
             )
-            draw_cyber_hud_bar(stdscr, 0, w, left, "▸ q·back ", pair=CP_MAGENTA)
+            draw_cyber_hud_bar(stdscr, 0, w, left, "◈ q·back ◈", pair=CP_MAGENTA)
             safe_addstr(
                 stdscr,
                 1,
@@ -4710,12 +5492,17 @@ def show_identify(stdscr, cfg: dict[str, Any], iface: str) -> str:
                 idx = offset + i
                 if idx >= len(rows):
                     break
-                safe_addstr(stdscr, i + 2, 2, rows[idx], row_attrs[idx], w - 3)
-            safe_addstr(stdscr, h - 3, 0, ("─" * max(0, w - 1))[: w - 1], cp(CP_MAGENTA, dim=True))
-            safe_addstr(stdscr, h - 2, 2, ui_status.current()[: w - 4], cp(CP_YELLOW, dim=True))
+                line = rows[idx]
+                attr = apply_search_attr(row_attrs[idx], line, session)
+                safe_addstr(stdscr, i + 2, 2, line, attr, w - 3)
+            safe_addstr(stdscr, h - 2, 0, ("─" * max(0, w - 1))[: w - 1], cp(CP_MAGENTA, dim=True))
+            draw_context_footer(stdscr, h - 1, w, ui_status.current())
             stdscr.refresh()
             ch = stdscr.getch()
             if ch == -1:
+                continue
+            if handle_session_keys(stdscr, cfg, dash, iface, session, ui_status, ch, y=h - 3, w=w):
+                dash = collect_state(cfg, iface, network=False)
                 continue
             if ch in (ord("q"), ord("Q"), 27):
                 cyber_screen_exit(stdscr)
@@ -4799,7 +5586,7 @@ def show_identify(stdscr, cfg: dict[str, Any], iface: str) -> str:
         stdscr.timeout(IDLE_TIMEOUT_MS)
 
 
-def show_host_exposure(stdscr, cfg: dict[str, Any], iface: str) -> str:
+def show_host_exposure(stdscr, cfg: dict[str, Any], iface: str, session: UiSession) -> str:
     cyber_screen_enter(stdscr, "HOST")
     cfg = load_config()
     ok, msg = gate_capability(stdscr, cfg, check_host_exposure_gap(cfg))
@@ -4807,8 +5594,7 @@ def show_host_exposure(stdscr, cfg: dict[str, Any], iface: str) -> str:
         cyber_screen_exit(stdscr)
         return msg if msg != "cancelled" else ""
     ttl = status_flash_seconds(cfg)
-    legend = f"{binding_label(cfg, 'trust')} trust · d port dig · r refresh · q back"
-    ui_status = FlashStatus(legend, ttl=ttl)
+    ui_status = FlashStatus(host_exposure_status_legend(cfg), ttl=ttl)
     skip_next_collect = False
     stdscr.timeout(IDLE_TIMEOUT_MS)
     try:
@@ -4819,8 +5605,12 @@ def show_host_exposure(stdscr, cfg: dict[str, Any], iface: str) -> str:
             skip_next_collect = False
             stdscr.erase()
             h, w = stdscr.getmaxyx()
-            footer = ui_status.current()
-            draw_cyber_hud_bar(stdscr, 0, w, " HOST EXPOSURE // sessions reaching THIS node ", footer, pair=CP_ALERT)
+            hud = " HOST EXPOSURE // sessions reaching THIS node "
+            if session.redact:
+                hud += " ◈REDACT◈"
+            if session.search_query:
+                hud += f" find:{session.search_query[:8]}"
+            draw_cyber_hud_bar(stdscr, 0, w, hud, "◈ q·back ◈", pair=CP_ALERT)
             row = 2
             half = max(24, (w - 3) // 2)
 
@@ -4828,43 +5618,60 @@ def show_host_exposure(stdscr, cfg: dict[str, Any], iface: str) -> str:
             lines: list[str] = []
             attrs: list[int] = []
             for f in dash.inbound:
-                tag = "▸UNTRUSTED" if f.is_new else "trusted"
-                lines.append(f"{f.remote_ip:<16} → {f.service:<8} {f.proc or '?'}")
-                lines.append(f"  {f.name[:28]}  {tag}")
-                attrs.extend([cp(CP_ALERT, bold=True) if f.is_new else cp(CP_GREEN), cp(CP_WHITE, dim=True)])
+                tag = rt("▸UNTRUSTED" if f.is_new else "trusted", "text", cfg, session)
+                rip = rt(f.remote_ip, "ip", cfg, session)
+                svc = rt(f.service, "text", cfg, session)
+                proc = rt(f.proc or "?", "text", cfg, session)
+                name = rt(f.name[:28], "name", cfg, session)
+                lines.append(f"{rip:<16} → {svc:<8} {proc}")
+                lines.append(f"  {name}  {tag}")
+                base = cp(CP_ALERT, bold=True) if f.is_new else cp(CP_GREEN)
+                attrs.extend(
+                    [
+                        apply_search_attr(base, lines[-2], session),
+                        apply_search_attr(cp(CP_WHITE, dim=True), lines[-1], session),
+                    ]
+                )
             if not lines:
-                lines = ["(no remote sessions to listening ports)"]
+                lines = ["(no remote sessions — trust or snooze when active)"]
             put_lines(stdscr, row + 1, 2, half - 4, lines, cp(CP_WHITE, dim=True), line_attrs=attrs or None)
 
             draw_cyber_panel(stdscr, row, half + 1, h - row - 2, w - half - 2, "PATHS :: bridges/tunnels", pair=CP_MAGENTA)
             path_lines: list[str] = []
             for b in dash.bridges:
-                path_lines.append(f"◈ {b.name} ({b.state})")
-                path_lines.append(f"  {b.note[: half - 6]}")
+                state = rt(b.state, "text", cfg, session)
+                path_lines.append(f"◈ {rt(b.name, 'name', cfg, session)} ({state})")
+                path_lines.append(f"  {rt(b.note[: half - 6], 'text', cfg, session)}")
             if dash.login_sessions:
-                path_lines.append("── logins (who) ──")
-                path_lines.extend(dash.login_sessions)
+                path_lines.append(rt("── logins ──", "text", cfg, session))
+                path_lines.extend(rt(s, "text", cfg, session) for s in dash.login_sessions)
             if dash.exposed:
-                path_lines.append("── LAN listeners ──")
+                path_lines.append(rt("── LAN listeners ──", "text", cfg, session))
                 for e in dash.exposed:
                     mark = "!" if e.risk == "alert" else "·"
-                    label = format_listener_label(e)
-                    extra = f" {e.proto}" if e.proto else ""
-                    path_lines.append(f"{mark} :{e.port}{extra} {label}")
-                path_lines.append("  d + port# to dig (e.g. d11434)")
+                    label = rt(format_listener_label(e), "name", cfg, session)
+                    extra = rt(f" {e.proto}", "text", cfg, session) if e.proto else ""
+                    path_lines.append(
+                        f"{mark} :{rt(str(e.port), 'text', cfg, session)} {label}{extra}"
+                    )
+                path_lines.append(rt("  d + port# to dig (e.g. d11434)", "text", cfg, session))
             put_lines(
                 stdscr,
                 row + 1,
                 half + 3,
                 w - half - 5,
-                path_lines or ["(no bridges/tunnels detected)"],
+                    path_lines or ["(no bridges/tunnels — press R·sync)"],
                 cp(CP_MAGENTA, dim=True),
             )
 
-            draw_cyber_footer(stdscr, h - 1, w, footer)
+            draw_context_footer(stdscr, h - 1, w, ui_status.current())
             stdscr.refresh()
             ch = stdscr.getch()
             if ch == -1:
+                continue
+            if handle_session_keys(stdscr, cfg, dash, iface, session, ui_status, ch, y=h - 3, w=w):
+                dash = collect_state(cfg, iface, network=False)
+                skip_next_collect = True
                 continue
             if ch in (ord("q"), ord("Q"), 27):
                 cyber_screen_exit(stdscr)
@@ -4951,7 +5758,9 @@ def render(
     scanned,
     frame: int = 0,
     panel_page: int = 0,
+    ui_session: UiSession | None = None,
 ) -> None:
+    session = ui_session or UiSession()
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     _, gateway, local = default_route()
@@ -4959,16 +5768,22 @@ def render(
     clock = time.strftime("%H:%M:%S")
     per_page = panels_per_page(cfg)
     content_w = dashboard_panel_content_width(w)
-    all_panels = build_dashboard_panels(cfg, dash, scanned, content_w)
+    all_panels = build_dashboard_panels(cfg, dash, scanned, content_w, session)
     pages = panel_page_count(len(all_panels), cfg)
     panel_page = panel_page % pages
     visible = all_panels[panel_page * per_page : (panel_page + 1) * per_page]
     page_label = f"panels {panel_page * per_page + 1}-{panel_page * per_page + len(visible)}/{len(all_panels)}"
 
+    node = rt(local or "?", "ip", cfg, session)
+    gw = rt(gateway or "?", "ip", cfg, session)
     left = (
         f" NETWATCH // CYBERNETIC UPLINK  {pulse}  "
-        f"node·{local or '?'}  gw·{gateway or '?'}  {clock} "
+        f"node·{node}  gw·{gw}  {clock} "
     )
+    if session.redact:
+        left += " ◈REDACT◈"
+    if session.search_query:
+        left += f" find:{session.search_query[:10]}"
     draw_cyber_hud_bar(
         stdscr,
         0,
@@ -4986,7 +5801,8 @@ def render(
             f" ⚠ UNKNOWN: {len(dash.new_macs)} device(s) — "
             f"{binding_label(cfg, 'block')}·block  "
             f"{binding_label(cfg, 'identify')}·identify  "
-            f"{binding_label(cfg, 'trust')}·trust "
+            f"{binding_label(cfg, 'trust')}·trust  "
+            f"{binding_label(cfg, 'snooze')}·snooze "
         )
         safe_addstr(stdscr, row, 0, alert[: w - 1], cp(CP_ALERT, bold=True), w)
         row += 1
@@ -4998,7 +5814,8 @@ def render(
         alert = (
             f" ⚠ HOST EXPOSURE: {len(dash.new_inbound)} remote peer(s) on THIS PC "
             f"— {binding_label(cfg, 'host_exposure')}·detail  "
-            f"{binding_label(cfg, 'trust')}·trust "
+            f"{binding_label(cfg, 'trust')}·trust  "
+            f"{binding_label(cfg, 'snooze')}·snooze "
         )
         safe_addstr(stdscr, row, 0, alert[: w - 1], cp(CP_ALERT, bold=True), w)
         row += 1
@@ -5022,6 +5839,14 @@ def render(
         extra = f" ({panel.total})" if panel.total > items_per_panel(cfg) else ""
         title = f"{panel.title}{extra}"
         draw_cyber_panel(stdscr, py, px, cell_h, pw, title, pair=panel.pair)
+        line_attrs: list[int] = []
+        for i, line in enumerate(panel.lines):
+            base = (
+                panel.line_attrs[i]
+                if panel.line_attrs and i < len(panel.line_attrs)
+                else cp(CP_WHITE, dim=True)
+            )
+            line_attrs.append(apply_search_attr(base, line, session))
         put_lines(
             stdscr,
             py + 1,
@@ -5029,7 +5854,7 @@ def render(
             pw - 4,
             panel.lines,
             cp(CP_WHITE, dim=True),
-            line_attrs=panel.line_attrs,
+            line_attrs=line_attrs,
         )
 
     draw_cyber_footer(stdscr, h - 1, w, status, cfg)
@@ -5037,26 +5862,37 @@ def render(
 
 def main(stdscr) -> None:
     curses.curs_set(0)
-    init_cyber_theme()
+    cfg = load_config()
+    init_cyber_theme(str(cfg.get("display", {}).get("theme") or "cyber"))
     stdscr.timeout(IDLE_TIMEOUT_MS)
 
     iface, _, local = default_route()
-    cfg = load_config()
     ensure_oui_cache(cfg)
     scanned = False
+    ui_session = UiSession(redact=initial_redact_session(cfg))
     ui_status = FlashStatus(dashboard_status_legend(cfg), ttl=status_flash_seconds(cfg))
     ui_frame = 0
-    panel_page = 0
+    panel_page = initial_panel_page(cfg)
     cyber_screen_enter(stdscr, "BOOT")
     dash = run_with_cyber_loader(stdscr, "SYNC", collect_state, cfg, iface)
     last_refresh = time.time()
     auto = int(cfg.get("display", {}).get("refresh_seconds") or 0)
 
     while True:
-        render(stdscr, cfg, dash, ui_status.current(), scanned, ui_frame, panel_page=panel_page)
+        render(
+            stdscr,
+            cfg,
+            dash,
+            ui_status.current(),
+            scanned,
+            ui_frame,
+            panel_page=panel_page,
+            ui_session=ui_session,
+        )
         ui_frame += 1
         if auto and time.time() - last_refresh >= auto:
             cfg = load_config()
+            init_cyber_theme(str(cfg.get("display", {}).get("theme") or "cyber"))
             ui_status.legend = dashboard_status_legend(cfg)
             ui_status.ttl = status_flash_seconds(cfg)
             dash = collect_state(cfg, iface)
@@ -5066,10 +5902,16 @@ def main(stdscr) -> None:
         ch = stdscr.getch()
         if ch == -1:
             continue
+        h, w = stdscr.getmaxyx()
+        if handle_session_keys(stdscr, cfg, dash, iface, ui_session, ui_status, ch, y=h - 3, w=w):
+            dash = collect_state(cfg, iface, network=False)
+            continue
         if ch == 27 or key_matches_action(cfg, ch, "quit"):
+            save_ui_state(cfg, panel_page=panel_page, redact=ui_session.redact)
             break
         if key_matches_action(cfg, ch, "refresh"):
             cfg = load_config()
+            init_cyber_theme(str(cfg.get("display", {}).get("theme") or "cyber"))
             ui_status.legend = dashboard_status_legend(cfg)
             ui_status.ttl = status_flash_seconds(cfg)
             auto = int(cfg.get("display", {}).get("refresh_seconds") or 0)
@@ -5077,16 +5919,19 @@ def main(stdscr) -> None:
             ui_status.flash(f"refresh {time.strftime('%H:%M:%S')}")
             last_refresh = time.time()
         elif key_matches_action(cfg, ch, "panel_next"):
-            panels = build_dashboard_panels(cfg, dash, scanned)
+            panels = build_dashboard_panels(cfg, dash, scanned, ui_session=ui_session)
             panel_page = advance_panel_page(panel_page, len(panels), cfg)
+            save_ui_state(cfg, panel_page=panel_page)
             ui_status.flash(f"panel page {panel_page + 1}/{panel_page_count(len(panels), cfg)}")
         elif key_matches_action(cfg, ch, "panel_prev"):
-            panels = build_dashboard_panels(cfg, dash, scanned)
+            panels = build_dashboard_panels(cfg, dash, scanned, ui_session=ui_session)
             panel_page = retreat_panel_page(panel_page, len(panels), cfg)
+            save_ui_state(cfg, panel_page=panel_page)
             ui_status.flash(f"panel page {panel_page + 1}/{panel_page_count(len(panels), cfg)}")
         elif key_matches_action(cfg, ch, "options"):
             msg = show_options(stdscr, cfg)
             cfg = load_config()
+            init_cyber_theme(str(cfg.get("display", {}).get("theme") or "cyber"))
             ui_status.legend = dashboard_status_legend(cfg)
             ui_status.ttl = status_flash_seconds(cfg)
             auto = int(cfg.get("display", {}).get("refresh_seconds") or 0)
@@ -5119,12 +5964,12 @@ def main(stdscr) -> None:
             n_inbound, n_lan, dash = run_with_cyber_loader(stdscr, "TRUST", trust_and_refresh)
             ui_status.flash(trust_status_message(n_inbound, n_lan))
         elif key_matches_action(cfg, ch, "host_exposure"):
-            msg = show_host_exposure(stdscr, cfg, iface)
+            msg = show_host_exposure(stdscr, cfg, iface, ui_session)
             dash = collect_state(cfg, iface, network=False)
             if msg:
                 ui_status.flash(msg)
         elif key_matches_action(cfg, ch, "identify"):
-            msg = show_identify(stdscr, cfg, iface)
+            msg = show_identify(stdscr, cfg, iface, ui_session)
             dash = collect_state(cfg, iface, network=False)
             if msg:
                 ui_status.flash(msg)
@@ -5164,7 +6009,7 @@ def ensure_runtime_data_files() -> None:
     if not known_default.is_file():
         known_default.write_text("{}\n")
     if not ALERT_STATE_PATH.is_file():
-        ALERT_STATE_PATH.write_text('{"notified_macs": {}}\n')
+        ALERT_STATE_PATH.write_text('{"notified_macs": {}, "snoozed": {}}\n')
     secrets_example = CONFIG_DIR / "secrets.env.example"
     if not secrets_example.is_file():
         secrets_example.write_text(

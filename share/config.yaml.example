@@ -50,6 +50,12 @@ display:
   panels_per_page: 4
   items_per_panel: 15
   status_flash_seconds: 3.0
+  theme: cyber          # cyber | synthwave | amber (Options → cycle)
+  redact_level: partial # partial = heavy mask (screenshot-safe) | full = solid blocks
+  remember_panel_page: true
+
+snooze:
+  default_hours: 24     # Z on dashboard — silence alerts without trusting
 
 identify:
   auto_enrich: true
@@ -70,6 +76,8 @@ notifications:
   enabled: true
   # Re-alert for the same unknown MAC after this many hours:
   repeat_hours: 24
+  # Skip repeat notify when MAC is still on the same IP:
+  dedupe_same_ip: true
   desktop:
     enabled: true
   email:

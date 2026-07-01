@@ -19,6 +19,11 @@ No cloud. No auto-install of packages or sudo rules without your consent. Secret
 - **Host exposure** — who connects *to this PC*, bridges/tunnels, live listener resolution via `ss`/`lsof`
 - **Quarantine** — manual block unknown devices (nftables/firewalld + optional router MAC deny)
 - **Options UI** — toggle settings, rebind keys, consent gates before installing optional tools
+- **Redact mode (V)** — censor IPs/MACs/names for screen share (layout unchanged)
+- **Search filter (/)** — highlight matching rows; non-matches dim
+- **Snooze (Z)** — silence alerts 24h without trusting
+- **Copy (C)** — copy focused row to clipboard (wl-clipboard / xclip)
+- **Themes** — cyber, synthwave, amber (Options)
 
 ## Requirements
 
