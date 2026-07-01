@@ -238,11 +238,10 @@ DEFAULT_KEYBINDINGS: dict[str, tuple[str, str]] = {
     "panel_next": ("Next panel page", "W"),
     "panel_prev": ("Previous panel page", "w"),
     "identify": ("Identify / label devices", "i"),
-    "acknowledge": ("Acknowledge trusted MACs", "a"),
+    "trust": ("Trust devices & inbound peers", "t"),
     "block": ("Block unknown device (quarantine)", "b"),
     "registry": ("Blocked-device registry", "g"),
     "host_exposure": ("Host exposure detail view", "e"),
-    "trust_inbound": ("Trust inbound peers", "t"),
     "options": ("Options & keybindings", "o"),
     "help": ("Full help datasheet", "h"),
     "quit": ("Quit", "q"),
@@ -255,6 +254,11 @@ def binding_key(cfg: dict[str, Any], action: str) -> str:
     custom = (cfg.get("keybindings") or {}).get(action)
     if isinstance(custom, str) and len(custom) == 1:
         return custom
+    if action == "trust":
+        for legacy in ("trust_inbound", "acknowledge"):
+            legacy_key = (cfg.get("keybindings") or {}).get(legacy)
+            if isinstance(legacy_key, str) and len(legacy_key) == 1:
+                return legacy_key
     return DEFAULT_KEYBINDINGS[action][1]
 
 
@@ -380,18 +384,18 @@ def help_lines(cfg: dict[str, Any]) -> list[str]:
         "    2. Press i → n to resolve names",
         "    3. Press l on each row — e.g. 'my phone', 'Smart TV'",
         f"    4. Cross-check {router_ui} router UI",
-        "    5. Press a on dashboard to acknowledge trusted MACs",
+        "    5. Press T on dashboard to trust unknown LAN devices and inbound peers",
         "",
         "── Keys (dashboard) ──",
         f"  {binding_label(cfg, 'refresh')}   refresh (ARP + cached data)",
         f"  {binding_label(cfg, 'scan')}   house scan — full /24 ping + mDNS (+ nmap if installed)",
         f"  {binding_label(cfg, 'identify')}   identify / label devices",
-        f"  {binding_label(cfg, 'acknowledge')}   acknowledge trusted MACs",
+        f"  {binding_label(cfg, 'trust')}   trust unknown LAN devices and inbound peers",
         f"  {binding_label(cfg, 'block')}   block unknown device (countermeasure)",
         f"  {binding_label(cfg, 'registry')}   blocked-device registry",
         f"  {binding_label(cfg, 'panel_next')}   next panel page · {binding_label(cfg, 'panel_prev')} previous",
         f"  {binding_label(cfg, 'options')}   options & keybindings (tab→keys pane, space rebind, s save)",
-        f"  {binding_label(cfg, 'host_exposure')}   host exposure detail · {binding_label(cfg, 'trust_inbound')} trust inbound peers",
+        f"  {binding_label(cfg, 'host_exposure')}   host exposure detail",
         f"  {binding_label(cfg, 'help')}   help   {binding_label(cfg, 'quit')}   quit",
         "  LAN panel = ARP cache on THIS PC (recently active, same subnet).",
         "  Repeaters on one SSID usually share the same gateway subnet.",
@@ -410,7 +414,7 @@ def help_lines(cfg: dict[str, Any]) -> list[str]:
         f"  probe harnesses:   {cfg['harnesses']['directory']}",
         "",
         "── Alerts ──",
-        "  Unknown MAC → red banner until you label (l), trust (a), or block (b).",
+        "  Unknown MAC → red banner until you label (l), trust (T), or block (b).",
         "",
         "── Countermeasures ──",
         "  netwatch --configure   router username/password (secrets.env, chmod 600)",
@@ -436,7 +440,7 @@ def help_lines(cfg: dict[str, Any]) -> list[str]:
         "  Bridges/tunnels: docker0, tailscale0, virbr — paths into this box.",
         "  Exposed listeners: resolved live from ss/lsof (any new port auto-detected).",
         "  Root-owned services need one-time: netwatch --setup (sudo ss/lsof, not hardcoded).",
-        "  e   host exposure detail   T   trust current inbound peers",
+        "  e   host exposure detail   T   trust devices and inbound peers",
         "  In detail view: d + port to re-resolve a listener.",
         "  CLI: netwatch --dig-listeners   netwatch --dig-port PORT",
         "",
@@ -453,6 +457,7 @@ class LanDevice:
     mac: str
     state: str
     is_new: bool = False
+    trusted: bool = False
     label: str = ""
     hostname: str = ""
     vendor: str = ""
@@ -1052,6 +1057,7 @@ def enrich_devices(
     for dev in devices:
         entry = known.get(dev.mac, {})
         dev.label = (entry.get("label") or "").strip()
+        dev.trusted = bool(entry.get("acknowledged") or entry.get("trusted"))
         dev.hostname = (entry.get("hostname") or "").strip()
         dev.vendor = (entry.get("vendor") or "").strip()
         auto_guess = (entry.get("auto_guess") or "").strip()
@@ -1122,18 +1128,18 @@ def enrich_devices(
 def device_needs_attention(
     dev: LanDevice, known: dict[str, dict], cfg: dict[str, Any]
 ) -> bool:
-    """Stay flagged until the user labels, acknowledges, or blocks the device."""
+    """Stay flagged until the user labels, trusts, or blocks the device."""
     if is_blocked_mac(cfg, dev.mac):
         return False
     entry = known.get(dev.mac) or {}
-    if entry.get("acknowledged"):
+    if entry.get("acknowledged") or entry.get("trusted"):
         return False
     label = (dev.label or entry.get("label") or "").strip()
     return not label
 
 
 def update_known(
-    known: dict[str, dict], devices: list[LanDevice], acknowledge: bool
+    known: dict[str, dict], devices: list[LanDevice], trust: bool
 ) -> dict[str, dict]:
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     for dev in devices:
@@ -1148,8 +1154,9 @@ def update_known(
             entry["hostname"] = dev.hostname
         if dev.vendor:
             entry["vendor"] = dev.vendor
-        if acknowledge:
+        if trust:
             entry["acknowledged"] = True
+            entry["trusted"] = True
         known[dev.mac] = entry
     return known
 
@@ -1683,12 +1690,12 @@ def format_outbound_lines(flows: list[OutboundFlow], width: int, limit: int = 8)
             rows.append(f"  {f.name[:16]}  {f.notes}"[: width - 1])
         return rows
 
-    conn_w = min(26, max(14, width * 2 // 5))
-    name_w = min(16, max(8, width // 4))
+    conn_w = max(14, min(width - 18, int(width * 0.40)))
+    name_w = max(8, min(width - conn_w - 10, int(width * 0.26)))
     note_w = max(6, width - conn_w - name_w - 2)
     rows = [
-        f"{'CONNECTION':<{conn_w}} {'NAME':<{name_w}} NOTES"[: width - 1],
-        ("─" * min(width - 1, conn_w + name_w + 6))[: width - 1],
+        f"{'CONNECTION':<{conn_w}} {'NAME':<{name_w}} {'NOTES':<{note_w}}"[: width - 1],
+        ("─" * (width - 1))[: width - 1],
     ]
     for f in flows:
         row = f"{f.connection[:conn_w]:<{conn_w}} {f.name[:name_w]:<{name_w}} {f.notes[:note_w]}"
@@ -1980,6 +1987,27 @@ def trust_inbound_ips(cfg: dict[str, Any], ips: list[str]) -> int:
     return count
 
 
+def trust_all(
+    cfg: dict[str, Any],
+    dash: DashboardState,
+    iface: str,
+) -> tuple[int, int, DashboardState]:
+    """Trust new inbound peers and clear unknown-device alerts for current LAN MACs."""
+    pending_lan = len(dash.new_macs)
+    n_inbound = trust_inbound_ips(cfg, dash.new_inbound)
+    state = collect_state(cfg, iface, trust=True, network=False)
+    return n_inbound, pending_lan, state
+
+
+def trust_status_message(n_inbound: int, n_lan: int) -> str:
+    parts: list[str] = []
+    if n_lan:
+        parts.append(f"{n_lan} LAN device(s)")
+    if n_inbound:
+        parts.append(f"{n_inbound} inbound peer(s)")
+    return f"trusted {' · '.join(parts)}" if parts else "nothing new to trust"
+
+
 def inbound_flows(
     cfg: dict[str, Any],
     known: dict[str, dict],
@@ -2072,12 +2100,18 @@ def format_inbound_lines(flows: list[InboundFlow], width: int, limit: int = 6) -
             rows.append(f"{f.remote_ip[:14]} → :{f.service}{tag}"[: width - 1])
         return rows
 
-    peer_w = min(18, max(10, width // 3))
-    svc_w = min(10, max(6, width // 5))
-    rows = [f"{'REMOTE':<{peer_w}} {'SVC':<{svc_w}} PROC"[: width - 1]]
+    peer_w = max(10, min(width - 16, int(width * 0.34)))
+    svc_w = max(6, min(width - peer_w - 12, int(width * 0.18)))
+    proc_w = max(4, width - peer_w - svc_w - 2)
+    rows = [f"{'REMOTE':<{peer_w}} {'SVC':<{svc_w}} {'PROC':<{proc_w}}"[: width - 1]]
+    rows.append(("─" * (width - 1))[: width - 1])
     for f in flows:
         tag = "*" if f.is_new else " "
-        row = f"{tag}{f.name[:peer_w - 1]:<{peer_w - 1}} {f.service[:svc_w]:<{svc_w}} {f.proc[: max(4, width - peer_w - svc_w - 2)]}"
+        row = (
+            f"{tag}{f.name[: peer_w - 1]:<{peer_w - 1}} "
+            f"{f.service[:svc_w]:<{svc_w}} "
+            f"{f.proc[:proc_w]}"
+        )
         rows.append(row[: width - 1])
     return rows
 
@@ -3686,7 +3720,7 @@ def cli_restore_blocks(cfg: dict[str, Any] | None = None) -> int:
 def collect_state(
     cfg: dict[str, Any],
     iface: str,
-    acknowledge: bool = False,
+    trust: bool = False,
     *,
     force_identify: bool = False,
     network: bool = True,
@@ -3698,7 +3732,7 @@ def collect_state(
     state.router_clients, state.router_note = router_clients(cfg)
 
     if cfg["alerts"].get("enabled", True):
-        known = update_known(known, devices, acknowledge)
+        known = update_known(known, devices, trust)
     else:
         pass
 
@@ -3836,6 +3870,14 @@ def loader_inner_width(term_w: int) -> int:
     if term_w >= 80:
         return min(term_w - 6, 68)
     return max(36, min(term_w - 4, 52))
+
+
+def dashboard_panel_content_width(term_w: int) -> int:
+    """Inner text width for a 2×2 dashboard panel (border + padding)."""
+    gap_x = 1
+    cols = 2
+    cell_w = max(20, (term_w - gap_x) // cols)
+    return max(16, cell_w - 4)
 
 
 def loader_title_rule(inner_w: int) -> str:
@@ -4059,9 +4101,11 @@ def build_dashboard_panels(
     cfg: dict[str, Any],
     dash: DashboardState,
     scanned: bool,
+    content_w: int = 36,
 ) -> list[DashboardPanel]:
     """Build all panel containers dynamically from config + live state."""
     cap = items_per_panel(cfg)
+    content_w = max(16, content_w)
     panels: list[DashboardPanel] = []
     he = cfg.get("host_exposure", {})
     router_on = cfg["router"].get("enabled") and (cfg["router"].get("type") or "disabled").lower() != "disabled"
@@ -4071,12 +4115,14 @@ def build_dashboard_panels(
     if scanned:
         lan_lines.append("◈ post house-scan sweep")
         lan_attrs.append(cp(CP_MAGENTA, bold=True))
+    ip_w = max(15, min(18, content_w // 3))
+    name_w = max(8, content_w - ip_w - 4)
     for d in dash.devices[:cap]:
         tag = " ▸NEW" if d.is_new else ""
         if is_blocked_mac(cfg, d.mac):
             tag = " ⛔BLOCK"
-        name = (d.label or d.guess or d.hostname or "?")[:14]
-        lan_lines.append(f"{d.ip:<15} {name:<14}{tag}")
+        name = (d.label or d.guess or d.hostname or "?")[:name_w]
+        lan_lines.append(f"{d.ip:<{ip_w}} {name:<{name_w}}{tag}"[:content_w])
         lan_attrs.append(_lan_line_attr(d, scanned))
     panels.append(
         DashboardPanel(
@@ -4094,7 +4140,8 @@ def build_dashboard_panels(
         ts_attrs: list[int] = []
         for p in dash.tailscale[:cap]:
             glyph = "◉" if p.online else "○"
-            ts_lines.append(f"{glyph} {p.name[:18]:<18} {p.ip}")
+            name_w = max(10, content_w - len(p.ip) - 3)
+            ts_lines.append(f"{glyph} {p.name[:name_w]:<{name_w}} {p.ip}"[:content_w])
             ts_attrs.append(cp(CP_GREEN, bold=True) if p.online else cp(CP_BLUE, dim=True))
         panels.append(
             DashboardPanel(
@@ -4108,7 +4155,10 @@ def build_dashboard_panels(
         )
 
     if router_on:
-        rlines = [f"◈ {(c.name or '?')[:12]:<12} {c.ip}" for c in dash.router_clients[:cap]]
+        rlines = []
+        for c in dash.router_clients[:cap]:
+            name_w = max(8, content_w - len(c.ip) - 4)
+            rlines.append(f"◈ {(c.name or '?')[:name_w]:<{name_w}} {c.ip}"[:content_w])
         panels.append(
             DashboardPanel(
                 "router",
@@ -4119,8 +4169,7 @@ def build_dashboard_panels(
             )
         )
 
-    out_w = 36
-    out_lines = format_outbound_lines(dash.outbound, out_w, limit=cap)
+    out_lines = format_outbound_lines(dash.outbound, content_w, limit=cap)
     panels.append(
         DashboardPanel(
             "outbound",
@@ -4133,13 +4182,13 @@ def build_dashboard_panels(
 
     if he.get("enabled", True):
         if he.get("monitor_inbound", True):
-            in_lines = format_inbound_lines(dash.inbound, 32, limit=cap)
+            in_lines = format_inbound_lines(dash.inbound, content_w, limit=cap)
             in_attrs = [
-                cp(CP_ALERT, bold=True) if f.is_new else cp(CP_WHITE, dim=True)
+                cp(CP_ALERT, bold=True) if f.is_new else cp(CP_GREEN)
                 for f in dash.inbound[:cap]
             ]
             if in_lines and in_lines[0].startswith("REMOTE"):
-                in_attrs = [cp(CP_CYAN, dim=True)] + (in_attrs or [])
+                in_attrs = [cp(CP_CYAN, dim=True), cp(CP_CYAN, dim=True)] + (in_attrs or [])
             panels.append(
                 DashboardPanel(
                     "inbound",
@@ -4153,7 +4202,7 @@ def build_dashboard_panels(
 
         if he.get("monitor_listeners", True):
             exp_lines = [
-                f"{'!' if e.risk == 'alert' else '·'} :{e.port} {format_listener_label(e)}"[:34]
+                f"{'!' if e.risk == 'alert' else '·'} :{e.port} {format_listener_label(e)}"[:content_w]
                 for e in dash.exposed[:cap]
             ]
             panels.append(
@@ -4169,8 +4218,8 @@ def build_dashboard_panels(
         if he.get("monitor_bridges", True):
             path_lines: list[str] = []
             for b in dash.bridges[:cap]:
-                path_lines.append(f"◈ {b.name} ({b.state})")
-                path_lines.append(f"  {b.note[:30]}")
+                path_lines.append(f"◈ {b.name} ({b.state})"[:content_w])
+                path_lines.append(f"  {b.note[: content_w - 2]}"[:content_w])
             if dash.login_sessions:
                 path_lines.append("── logins ──")
                 path_lines.extend(dash.login_sessions[: max(1, cap // 3)])
@@ -4184,8 +4233,8 @@ def build_dashboard_panels(
                 )
             )
 
-    defense = [f"◈ fw · {firewall_state()[:22]}"]
-    defense.extend(quarantine_lines(dash.blocked, min(cap, 8)))
+    defense = [f"◈ fw · {firewall_state()[: max(8, content_w - 8)]}"[:content_w]]
+    defense.extend(quarantine_lines(dash.blocked, min(cap, 8), content_w))
     defense.extend(failed_logins()[: max(0, cap - len(defense))])
     panels.append(
         DashboardPanel(
@@ -4384,15 +4433,17 @@ def unknown_devices(devices: list[LanDevice], cfg: dict[str, Any]) -> list[LanDe
     return [d for d in devices if d.is_new and not is_blocked_mac(cfg, d.mac)]
 
 
-def quarantine_lines(blocked: list[BlockedEntry], limit: int = 4) -> list[str]:
+def quarantine_lines(blocked: list[BlockedEntry], limit: int = 4, width: int = 36) -> list[str]:
+    width = max(16, width)
     if not blocked:
         return ["◈ quarantine · empty"]
     online = sum(1 for b in blocked if b.online)
-    lines = [f"◈ quarantine · {len(blocked)} blocked · {online} online"]
+    lines = [f"◈ quarantine · {len(blocked)} blocked · {online} online"[:width]]
+    name_w = max(10, width // 3)
     for entry in blocked[:limit]:
         glyph = "◉ ONLINE" if entry.online else "○ offline"
-        name = (entry.label or entry.mac)[:14]
-        lines.append(f"  {name:<14} {entry.last_ip} {glyph}")
+        name = (entry.label or entry.mac)[:name_w]
+        lines.append(f"  {name:<{name_w}} {entry.last_ip} {glyph}"[:width])
     if len(blocked) > limit:
         lines.append(f"  … +{len(blocked) - limit} more")
     return lines
@@ -4518,7 +4569,7 @@ def identify_rows(
             attrs.append(cp(CP_YELLOW, bold=True))
         elif d.is_new:
             attrs.append(cp(CP_ALERT, bold=True))
-        elif d.label:
+        elif d.label or d.trusted:
             attrs.append(cp(CP_GREEN))
         else:
             attrs.append(cp(CP_WHITE, dim=True))
@@ -4756,13 +4807,16 @@ def show_host_exposure(stdscr, cfg: dict[str, Any], iface: str) -> str:
         cyber_screen_exit(stdscr)
         return msg if msg != "cancelled" else ""
     ttl = status_flash_seconds(cfg)
-    legend = "T trust · d port dig · r refresh · q back"
+    legend = f"{binding_label(cfg, 'trust')} trust · d port dig · r refresh · q back"
     ui_status = FlashStatus(legend, ttl=ttl)
+    skip_next_collect = False
     stdscr.timeout(IDLE_TIMEOUT_MS)
     try:
         while True:
             cfg = load_config()
-            dash = collect_state(cfg, iface, network=False)
+            if not skip_next_collect:
+                dash = collect_state(cfg, iface, network=False)
+            skip_next_collect = False
             stdscr.erase()
             h, w = stdscr.getmaxyx()
             footer = ui_status.current()
@@ -4815,9 +4869,13 @@ def show_host_exposure(stdscr, cfg: dict[str, Any], iface: str) -> str:
             if ch in (ord("q"), ord("Q"), 27):
                 cyber_screen_exit(stdscr)
                 return ""
-            if ch in (ord("t"), ord("T")):
-                n = trust_inbound_ips(cfg, dash.new_inbound or [f.remote_ip for f in dash.inbound if f.is_new])
-                ui_status.flash(f"trusted {n} inbound peer(s)" if n else "no new peers to trust")
+            if key_matches_action(cfg, ch, "trust"):
+                def trust_and_refresh() -> tuple[int, int, DashboardState]:
+                    return trust_all(cfg, dash, iface)
+
+                n_inbound, n_lan, dash = run_with_cyber_loader(stdscr, "TRUST", trust_and_refresh)
+                skip_next_collect = True
+                ui_status.flash(trust_status_message(n_inbound, n_lan))
             if ch in (ord("r"), ord("R")):
                 dash = collect_state(cfg, iface, network=False)
                 ui_status.flash(f"refresh {time.strftime('%H:%M:%S')}")
@@ -4878,7 +4936,7 @@ def show_help(stdscr, cfg: dict[str, Any]) -> None:
 def _lan_line_attr(device: LanDevice, scanned: bool) -> int:
     if device.is_new:
         return cp(CP_ALERT, bold=True)
-    if device.label:
+    if device.label or device.trusted:
         return cp(CP_GREEN)
     if scanned:
         return cp(CP_CYAN)
@@ -4900,7 +4958,8 @@ def render(
     pulse = cyber_pulse(frame)
     clock = time.strftime("%H:%M:%S")
     per_page = panels_per_page(cfg)
-    all_panels = build_dashboard_panels(cfg, dash, scanned)
+    content_w = dashboard_panel_content_width(w)
+    all_panels = build_dashboard_panels(cfg, dash, scanned, content_w)
     pages = panel_page_count(len(all_panels), cfg)
     panel_page = panel_page % pages
     visible = all_panels[panel_page * per_page : (panel_page + 1) * per_page]
@@ -4927,7 +4986,7 @@ def render(
             f" ⚠ UNKNOWN: {len(dash.new_macs)} device(s) — "
             f"{binding_label(cfg, 'block')}·block  "
             f"{binding_label(cfg, 'identify')}·identify  "
-            f"{binding_label(cfg, 'acknowledge')}·trust "
+            f"{binding_label(cfg, 'trust')}·trust "
         )
         safe_addstr(stdscr, row, 0, alert[: w - 1], cp(CP_ALERT, bold=True), w)
         row += 1
@@ -4939,7 +4998,7 @@ def render(
         alert = (
             f" ⚠ HOST EXPOSURE: {len(dash.new_inbound)} remote peer(s) on THIS PC "
             f"— {binding_label(cfg, 'host_exposure')}·detail  "
-            f"{binding_label(cfg, 'trust_inbound')}·trust "
+            f"{binding_label(cfg, 'trust')}·trust "
         )
         safe_addstr(stdscr, row, 0, alert[: w - 1], cp(CP_ALERT, bold=True), w)
         row += 1
@@ -5053,13 +5112,12 @@ def main(stdscr) -> None:
             dash = collect_state(cfg, iface, network=False)
             if msg:
                 ui_status.flash(msg)
-        elif key_matches_action(cfg, ch, "acknowledge"):
-            dash = collect_state(cfg, iface, acknowledge=True)
-            ui_status.flash("acknowledged current MACs")
-        elif key_matches_action(cfg, ch, "trust_inbound"):
-            n = trust_inbound_ips(cfg, dash.new_inbound)
-            dash = collect_state(cfg, iface, network=False)
-            ui_status.flash(f"trusted {n} inbound peer(s)" if n else "no new inbound peers")
+        elif key_matches_action(cfg, ch, "trust"):
+            def trust_and_refresh() -> tuple[int, int, DashboardState]:
+                return trust_all(cfg, dash, iface)
+
+            n_inbound, n_lan, dash = run_with_cyber_loader(stdscr, "TRUST", trust_and_refresh)
+            ui_status.flash(trust_status_message(n_inbound, n_lan))
         elif key_matches_action(cfg, ch, "host_exposure"):
             msg = show_host_exposure(stdscr, cfg, iface)
             dash = collect_state(cfg, iface, network=False)
