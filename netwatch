@@ -3254,6 +3254,13 @@ def gate_capability(stdscr, cfg: dict[str, Any], gap: CapabilityGap | None) -> t
     return True, msg
 
 
+def restore_tui_input(stdscr) -> None:
+    """Reset curses input state after modal prompts."""
+    curses.noecho()
+    curses.curs_set(0)
+    stdscr.timeout(IDLE_TIMEOUT_MS)
+
+
 def _draw_redact_modal(
     stdscr,
     *,
@@ -3262,27 +3269,107 @@ def _draw_redact_modal(
     options: list[tuple[str, str, bool]],
     footer: str,
     pair: int = CP_MAGENTA,
-) -> tuple[int, int, int, int]:
-    """Draw centered cyber modal. options: (key_label, text, enabled). Returns box bounds."""
+    reserve_input: bool = False,
+) -> tuple[int, int, int, int, int]:
+    """Draw centered cyber modal. options: (key_label, text, enabled). Returns box bounds + input row."""
     h, w = stdscr.getmaxyx()
+    input_rows = 2 if reserve_input else 0
     box_w = min(max(48, w - 4), 74)
-    box_h = min(max(14, len(body) + len(options) + 9), h - 4)
+    box_h = min(max(14, len(body) + len(options) + input_rows + 8), h - 4)
     box_y = max(1, (h - box_h) // 2)
     box_x = max(0, (w - box_w) // 2)
     draw_cyber_panel(stdscr, box_y, box_x, box_h, box_w, title, pair=pair)
     y = box_y + 1
-    for line in body[: box_h - len(options) - 8]:
+    body_limit = box_h - len(options) - input_rows - 7
+    for line in body[: max(0, body_limit)]:
         safe_addstr(stdscr, y, box_x + 2, line[: box_w - 4], cp(CP_YELLOW, dim=True))
         y += 1
-    y = max(y, box_y + box_h - len(options) - 5)
+    y = max(y, box_y + box_h - len(options) - input_rows - 5)
     for key_label, text, enabled in options:
         line = f" {key_label}  {text} "
         attr = cp(CP_CYAN, bold=True) if enabled else cp(CP_WHITE, dim=True)
         safe_addstr(stdscr, y, box_x + 2, line[: box_w - 4], attr)
         y += 1
-    safe_addstr(stdscr, h - 2, 2, footer[: w - 4], cp(CP_MAGENTA, dim=True))
+    if footer:
+        safe_addstr(
+            stdscr,
+            box_y + box_h - 3,
+            box_x + 2,
+            footer[: box_w - 4],
+            cp(CP_MAGENTA, dim=True),
+        )
+    input_y = box_y + box_h - 4 if reserve_input else -1
     stdscr.refresh()
-    return box_y, box_x, box_h, box_w
+    return box_y, box_x, box_h, box_w, input_y
+
+
+def prompt_secret_in_modal(
+    stdscr,
+    *,
+    title: str,
+    body: list[str],
+    options: list[tuple[str, str, bool]],
+    footer: str,
+    prompt: str,
+    pair: int = CP_MAGENTA,
+    max_len: int = 64,
+) -> str | None:
+    """Masked input inside modal. None = back/cancel (Esc or q when empty)."""
+    mask = "•"
+    buf: list[str] = []
+    curses.noecho()
+    curses.curs_set(1)
+    try:
+        while True:
+            stdscr.erase()
+            box_y, box_x, _box_h, box_w, input_y = _draw_redact_modal(
+                stdscr,
+                title=title,
+                body=body,
+                options=options,
+                footer=footer,
+                pair=pair,
+                reserve_input=True,
+            )
+            shown = mask * len(buf)
+            line = f"{prompt}{shown}"
+            safe_addstr(stdscr, input_y, box_x + 2, line[: box_w - 4], cp(CP_YELLOW, bold=True))
+            stdscr.move(input_y, box_x + 2 + min(len(line), max(0, box_w - 5)))
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch in (10, 13):
+                return "".join(buf)
+            if ch in (27,) or (ch in (ord("q"), ord("Q")) and not buf):
+                return None
+            if ch in (8, 127, curses.KEY_BACKSPACE):
+                if buf:
+                    buf.pop()
+            elif 32 <= ch <= 126 and len(buf) < max_len:
+                buf.append(chr(ch))
+    finally:
+        curses.noecho()
+        curses.curs_set(0)
+
+
+def wait_redact_modal_ack(
+    stdscr,
+    *,
+    title: str,
+    body: list[str],
+    pair: int = CP_ALERT,
+) -> bool:
+    """Wait for key. True = retry, False = back/cancel."""
+    stdscr.erase()
+    _draw_redact_modal(
+        stdscr,
+        title=title,
+        body=body,
+        options=[],
+        footer="▸ any key retry · Esc/q back",
+        pair=pair,
+    )
+    ch = stdscr.getch()
+    return ch not in (27, ord("q"), ord("Q"))
 
 
 def show_redact_guard_setup_modal(stdscr) -> str:
@@ -3314,7 +3401,7 @@ def show_redact_guard_setup_modal(stdscr) -> str:
                 title="VISIBILITY GUARD // REDACT LOCK",
                 body=body,
                 options=options,
-                footer="▸ neural privacy gate — Esc cancels",
+                footer="▸ neural privacy gate — Esc/q cancel",
                 pair=CP_MAGENTA,
             )
             ch = stdscr.getch()
@@ -3327,103 +3414,103 @@ def show_redact_guard_setup_modal(stdscr) -> str:
             if ch in (ord("n"), ord("N")):
                 return "none"
     finally:
-        stdscr.timeout(IDLE_TIMEOUT_MS)
+        restore_tui_input(stdscr)
 
 
-def configure_redact_pin(stdscr) -> bool:
-    """Collect and confirm a 4–6 digit PIN. Returns True when saved."""
+def configure_redact_pin(stdscr) -> str:
+    """Collect and confirm a 4–6 digit PIN. Returns ok | back."""
+    pin_options = [("Esc/q", "back to protection choices", True)]
+    pin_footer = "▸ masked input inside panel · Enter confirms"
     stdscr.timeout(-1)
     try:
         while True:
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-            body = [
-                "PIN must be 4–6 digits (numbers only).",
-                "Stored hashed in ui_state.json (chmod 600).",
-            ]
-            _draw_redact_modal(
+            pin = prompt_secret_in_modal(
                 stdscr,
                 title="VISIBILITY GUARD // SET PIN",
-                body=body,
-                options=[("Esc", "cancel setup", True)],
-                footer="▸ enter PIN at bottom · masked input",
+                body=[
+                    "PIN must be 4–6 digits (numbers only).",
+                    "Stored hashed in ui_state.json (chmod 600).",
+                ],
+                options=pin_options,
+                footer=pin_footer,
+                prompt="PIN: ",
                 pair=CP_ALERT,
+                max_len=6,
             )
-            pin = prompt_secret_line(stdscr, h - 3, "PIN: ", w)
+            if pin is None:
+                return "back"
             if not pin:
-                return False
-            if not pin.isdigit() or not (4 <= len(pin) <= 6):
-                stdscr.erase()
-                _draw_redact_modal(
-                    stdscr,
-                    title="VISIBILITY GUARD // SET PIN",
-                    body=["Invalid PIN — use 4–6 digits only.", "Press any key…"],
-                    options=[],
-                    footer="",
-                    pair=CP_ALERT,
-                )
-                stdscr.getch()
                 continue
-            confirm = prompt_secret_line(stdscr, h - 3, "Confirm PIN: ", w)
-            if not confirm:
-                return False
-            if confirm != pin:
-                stdscr.erase()
-                _draw_redact_modal(
+            if not pin.isdigit() or not (4 <= len(pin) <= 6):
+                if not wait_redact_modal_ack(
                     stdscr,
                     title="VISIBILITY GUARD // SET PIN",
-                    body=["PINs did not match.", "Press any key to retry…"],
-                    options=[],
-                    footer="",
-                    pair=CP_ALERT,
-                )
-                stdscr.getch()
+                    body=["Invalid PIN — use 4–6 digits only."],
+                ):
+                    return "back"
+                continue
+            confirm = prompt_secret_in_modal(
+                stdscr,
+                title="VISIBILITY GUARD // SET PIN",
+                body=["Re-enter PIN to confirm."],
+                options=pin_options,
+                footer=pin_footer,
+                prompt="Confirm: ",
+                pair=CP_ALERT,
+                max_len=6,
+            )
+            if confirm is None:
+                return "back"
+            if not confirm:
+                continue
+            if confirm != pin:
+                if not wait_redact_modal_ack(
+                    stdscr,
+                    title="VISIBILITY GUARD // SET PIN",
+                    body=["PINs did not match."],
+                ):
+                    return "back"
                 continue
             save_redact_guard({"configured": True, "mode": "pin", "pin_hash": hash_password(pin)})
-            return True
+            return "ok"
     finally:
-        stdscr.timeout(IDLE_TIMEOUT_MS)
+        restore_tui_input(stdscr)
 
 
 def show_redact_unlock_modal(stdscr, mode: str) -> bool:
     """Prompt for password or PIN to disable redact. Returns True when verified."""
     label = "login password" if mode == "password" else "PIN"
+    prompt = "PASSWORD: " if mode == "password" else "PIN: "
     stdscr.timeout(-1)
     try:
         while True:
-            stdscr.erase()
-            body = [
-                "Redact is active — sensitive fields are masked.",
-                f"Enter your {label} to declassify the dashboard.",
-            ]
-            _draw_redact_modal(
+            secret = prompt_secret_in_modal(
                 stdscr,
                 title="VISIBILITY UNLOCK // DECLASSIFY",
-                body=body,
-                options=[("Esc", "stay classified", True)],
-                footer="▸ unlock gate — Enter submits · Esc cancels",
+                body=[
+                    "Redact is active — sensitive fields are masked.",
+                    f"Enter your {label} to declassify the dashboard.",
+                ],
+                options=[("Esc/q", "stay classified", True)],
+                footer="▸ unlock gate · Enter submits",
+                prompt=prompt,
                 pair=CP_ALERT,
+                max_len=64 if mode == "password" else 6,
             )
-            h, w = stdscr.getmaxyx()
-            secret = prompt_secret_line(stdscr, h - 3, f"{label.upper()}: ", w)
-            if not secret:
+            if secret is None:
                 return False
+            if not secret:
+                continue
             if verify_redact_unlock(secret, mode):
                 return True
-            stdscr.erase()
-            _draw_redact_modal(
+            if not wait_redact_modal_ack(
                 stdscr,
                 title="VISIBILITY UNLOCK // DECLASSIFY",
-                body=[f"Wrong {label}.", "Press any key to retry or Esc…"],
-                options=[],
-                footer="",
-                pair=CP_ALERT,
-            )
-            ch = stdscr.getch()
-            if ch == 27:
+                body=[f"Wrong {label}."],
+            ):
                 return False
     finally:
-        stdscr.timeout(IDLE_TIMEOUT_MS)
+        restore_tui_input(stdscr)
 
 
 def toggle_redact_with_guard(
@@ -3433,48 +3520,57 @@ def toggle_redact_with_guard(
     ui_status: FlashStatus,
 ) -> None:
     """First V configures visibility guard; protected redact-off needs unlock."""
-    if not redact_guard_configured():
-        choice = show_redact_guard_setup_modal(stdscr)
-        if choice == "cancel":
-            ui_status.flash("visibility guard cancelled")
+    try:
+        if not redact_guard_configured():
+            while True:
+                choice = show_redact_guard_setup_modal(stdscr)
+                if choice == "cancel":
+                    ui_status.flash("visibility guard cancelled")
+                    return
+                if choice == "password":
+                    if not load_auth_record():
+                        ui_status.flash("no netwatch login — pick PIN or none")
+                        return
+                    save_redact_guard({"configured": True, "mode": "password"})
+                    ui_status.flash("redact on — unlock with login password")
+                    break
+                if choice == "pin":
+                    result = configure_redact_pin(stdscr)
+                    if result == "back":
+                        continue
+                    if result != "ok":
+                        ui_status.flash("PIN setup cancelled")
+                        return
+                    ui_status.flash("redact on — unlock with PIN")
+                    break
+                save_redact_guard({"configured": True, "mode": "none"})
+                ui_status.flash("redact on — no unlock required")
+                break
+            session.redact = True
+            save_ui_state(cfg, redact=True)
             return
-        if choice == "password":
-            if not load_auth_record():
-                ui_status.flash("no netwatch login — pick PIN or none")
-                return
-            save_redact_guard({"configured": True, "mode": "password"})
-            ui_status.flash("redact on — unlock with login password")
-        elif choice == "pin":
-            if not configure_redact_pin(stdscr):
-                ui_status.flash("PIN setup cancelled")
-                return
-            ui_status.flash("redact on — unlock with PIN")
+
+        if not session.redact:
+            session.redact = True
+            save_ui_state(cfg, redact=True)
+            ui_status.flash("redact on — classified view")
+            return
+
+        mode = redact_guard_mode()
+        if mode == "none":
+            session.redact = False
+            save_ui_state(cfg, redact=False)
+            ui_status.flash("redact off")
+            return
+
+        if show_redact_unlock_modal(stdscr, mode):
+            session.redact = False
+            save_ui_state(cfg, redact=False)
+            ui_status.flash("redact off — declassified")
         else:
-            save_redact_guard({"configured": True, "mode": "none"})
-            ui_status.flash("redact on — no unlock required")
-        session.redact = True
-        save_ui_state(cfg, redact=True)
-        return
-
-    if not session.redact:
-        session.redact = True
-        save_ui_state(cfg, redact=True)
-        ui_status.flash("redact on — classified view")
-        return
-
-    mode = redact_guard_mode()
-    if mode == "none":
-        session.redact = False
-        save_ui_state(cfg, redact=False)
-        ui_status.flash("redact off")
-        return
-
-    if show_redact_unlock_modal(stdscr, mode):
-        session.redact = False
-        save_ui_state(cfg, redact=False)
-        ui_status.flash("redact off — declassified")
-    else:
-        ui_status.flash("still classified")
+            ui_status.flash("still classified")
+    finally:
+        restore_tui_input(stdscr)
 
 
 class ZTERouterBlocker:
